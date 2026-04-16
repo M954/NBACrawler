@@ -1,0 +1,59 @@
+{
+  "data": [
+    {
+      "id": "1234567890",
+      "text": "What a W tonight! 40 points and the dub 💪🏾 #LakeShow",
+      "created_at": "2026-04-10T03:45:00.000Z",
+      "public_metrics": {
+        "retweet_count": 15200,
+        "reply_count": 3400,
+        "like_count": 89000,
+        "quote_count": 1200
+      },
+      "attachments": {
+        "media_keys": ["media_001"]
+      },
+      "referenced_tweets": null
+    },
+    {
+      "id": "1234567891",
+      "text": "Game day! Let's get it 🏀",
+      "created_at": "2026-04-09T18:00:00.000Z",
+      "public_metrics": {
+        "retweet_count": 5000,
+        "reply_count": 1200,
+        "like_count": 45000,
+        "quote_count": 300
+      },
+      "referenced_tweets": null
+    },
+    {
+      "id": "1234567892",
+      "text": "RT @NBA: LeBron James with the poster dunk of the year!",
+      "created_at": "2026-04-09T05:30:00.000Z",
+      "public_metrics": {
+        "retweet_count": 30000,
+        "reply_count": 500,
+        "like_count": 120000,
+        "quote_count": 5000
+      },
+      "referenced_tweets": [
+        {"type": "retweeted", "id": "9999999999"}
+      ]
+    }
+  ],
+  "includes": {
+    "media": [
+      {
+        "media_key": "media_001",
+        "type": "photo",
+        "url": "https://pbs.twimg.com/media/example_photo.jpg"
+      }
+    ]
+  },
+  "meta": {
+    "result_count": 3,
+    "newest_id": "1234567890",
+    "oldest_id": "1234567892"
+  }
+}

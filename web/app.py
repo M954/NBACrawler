@@ -1,0 +1,1062 @@
+"""篮球资讯爬虫 — Flask Web 仪表板"""
+
+from __future__ import annotations
+
+import json
+import threading
+import asyncio
+import os
+import re
+import time
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template, request
+
+app = Flask(__name__)
+
+# ── 全局状态 ──────────────────────────────────────────
+_articles: list[dict] = []
+_tweets: list[dict] = []
+_status: str = "idle"  # idle / running / stopped
+_tweet_status: str = "idle"  # idle / running
+_tweet_source_mode: str = "idle"  # idle / api / nitter / cache / failed
+_tweet_source_message: str = ""
+_enabled_sites: list[str] = ["yahoo_nba", "espn_nba", "cbs_nba"]
+_scraper_thread: threading.Thread | None = None
+_tweet_scraper_thread: threading.Thread | None = None
+_stop_event = threading.Event()
+_tweets_lock = threading.Lock()
+
+# ── 运行日志 ─────────────────────────────────────────
+_service_logs: list[dict] = []  # {time, level, msg}
+_MAX_LOGS = 200
+
+def _log(msg: str, level: str = "info"):
+    """记录服务日志（线程安全）。"""
+    from datetime import datetime
+    entry = {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "msg": msg}
+    _service_logs.append(entry)
+    if len(_service_logs) > _MAX_LOGS:
+        _service_logs.pop(0)
+    print(f"[{entry['time']}] [{level.upper()}] {msg}")
+
+OUTPUT_FILE = Path(__file__).resolve().parent.parent / "output" / "demo_results.json"
+TWEETS_FILE = Path(__file__).resolve().parent.parent / "output" / "tweets.json"
+
+# Nitter 多实例（自动降级）
+NITTER_INSTANCES = [
+    "https://nitter.net",
+    "https://nitter.privacydev.net",
+    "https://nitter.poast.org",
+    "https://xcancel.com",
+]
+
+
+def _set_tweet_source(mode: str, message: str = "") -> None:
+    """更新推文来源状态，供接口与前端展示。"""
+    global _tweet_source_mode, _tweet_source_message
+    _tweet_source_mode = mode
+    _tweet_source_message = message
+
+
+def _get_cached_tweets(limit: int = 30) -> list[dict]:
+    """返回当前内存中的最新缓存推文。"""
+    with _tweets_lock:
+        snapshot = list(_tweets)
+    snapshot.sort(key=lambda t: t.get("tweet_date", ""), reverse=True)
+    return snapshot[:limit]
+
+
+def _is_nitter_fallback_enabled() -> bool:
+    """仅在显式开启时才尝试不稳定的 Nitter 降级。"""
+    return os.environ.get("TWITTER_ALLOW_NITTER_FALLBACK", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _filter_latest_tweets(all_tweets: list[dict], limit: int = 30) -> list[dict]:
+    """按时间、去重和账号配额筛选最终展示推文。"""
+    media_handles = {"NBA", "ESPNNBA", "BleacherReport", "ShamsCharania"}
+    max_per_player = 3
+    max_media = 5
+
+    ranked = sorted(all_tweets, key=lambda t: t.get("tweet_date", ""), reverse=True)
+    seen_ids: set[str] = set()
+    player_counts: dict[str, int] = {}
+    media_count = 0
+    filtered: list[dict] = []
+
+    for tweet in ranked:
+        tweet_id = str(tweet.get("tweet_id", "")).strip()
+        handle = str(tweet.get("player_handle", "")).strip()
+        if not tweet_id or not handle or tweet_id in seen_ids:
+            continue
+        if handle in media_handles:
+            if media_count >= max_media:
+                continue
+            media_count += 1
+        else:
+            current = player_counts.get(handle, 0)
+            if current >= max_per_player:
+                continue
+            player_counts[handle] = current + 1
+        seen_ids.add(tweet_id)
+        filtered.append(tweet)
+        if len(filtered) >= limit:
+            break
+
+    _log(
+        f"去重筛选: {len(all_tweets)} -> {len(filtered)} 条（球星≤{max_per_player}条/人, 媒体≤{max_media}条）"
+    )
+    return filtered
+
+
+async def _translate_tweets(tweets: list[dict]) -> int:
+    """翻译推文内容并回填中文字段。"""
+    if not tweets:
+        return 0
+
+    translated = 0
+    _log(f"开始翻译 {len(tweets)} 条推文...")
+    try:
+        from translator.google_translator import DeepTranslatorBackend
+        from config.glossary import expand_twitter_slang, POST_TRANSLATION_FIXES
+
+        backend = DeepTranslatorBackend()
+        for tweet in tweets:
+            try:
+                text = expand_twitter_slang(tweet["content"])
+                content_cn = await backend.translate(text)
+                for wrong, right in POST_TRANSLATION_FIXES.items():
+                    content_cn = content_cn.replace(wrong, right)
+                tweet["content_cn"] = content_cn
+                tweet["translation_status"] = "completed"
+                translated += 1
+            except Exception:
+                tweet["translation_status"] = "failed"
+        _log(f"翻译完成: {translated}/{len(tweets)}", "success")
+    except Exception as exc:
+        _log(f"翻译初始化失败: {exc}", "error")
+
+    return translated
+
+
+async def _fetch_tweets_via_twitter_api(players) -> list[dict]:
+    """优先使用官方 API v2 抓取实时推文。"""
+    bearer_token = os.environ.get("TWITTER_BEARER_TOKEN", "").strip()
+    if not bearer_token:
+        _log("未配置 TWITTER_BEARER_TOKEN，跳过官方 API 实时抓取。", "warn")
+        return []
+
+    from scraper.twitter_scraper import TwitterScraper
+
+    scraper = TwitterScraper(
+        bearer_token=bearer_token,
+        nitter_instances=[],
+        enable_screenshots=False,
+    )
+    try:
+        _log(f"使用 Twitter API v2 抓取 {len(players)} 个账号...")
+        tweets = await scraper.scrape_all(players=players, limit=5)
+        payload = [tweet.to_dict() for tweet in tweets if tweet.content.strip()]
+        if payload:
+            _log(f"Twitter API 返回 {len(payload)} 条候选推文。", "success")
+        else:
+            _log("Twitter API 本次未返回可用推文。", "warn")
+        return payload
+    except Exception as exc:
+        _log(f"Twitter API 抓取失败: {exc}", "warn")
+        return []
+    finally:
+        await scraper.close()
+
+
+async def _fetch_tweets_via_syndication(players) -> list[dict]:
+    """通过 Twitter Syndication + fxtwitter 组合拉取最新推文（无需 token）。"""
+    import urllib.request
+    import urllib.error
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+
+    FXTWITTER_API = "https://api.fxtwitter.com"
+    SYNDICATION_URL = "https://syndication.twitter.com/srv/timeline-profile/screen-name"
+    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    MAX_IDS_PER_PLAYER = 3  # 每人取最新 3 条 ID 尝试
+    SYNDICATION_DELAY = 3.0  # Syndication 请求间隔（避免 429）
+    FX_DELAY = 0.5  # fxtwitter 请求间隔
+    RETRY_DELAY = 15.0  # 429 后的等待时间
+
+    all_tweets: list[dict] = []
+    success_count = 0
+    fail_count = 0
+    rate_limited = False
+    consecutive_429 = 0
+    MAX_CONSECUTIVE_429 = 3  # 连续限频 3 次就放弃剩余
+
+    _log(f"使用 Syndication+fxtwitter 抓取 {len(players)} 个账号...")
+
+    for index, player in enumerate(players):
+        handle = player.handle
+
+        # 如果被限频了，等待后再尝试
+        if rate_limited:
+            consecutive_429 += 1
+            if consecutive_429 >= MAX_CONSECUTIVE_429:
+                _log(f"连续 {consecutive_429} 次 429 限频，放弃剩余 Syndication 请求。", "warn")
+                break
+            _log(f"等待 {int(RETRY_DELAY)}s 后重试 (429 冷却 {consecutive_429}/{MAX_CONSECUTIVE_429})...", "warn")
+            await asyncio.sleep(RETRY_DELAY)
+            rate_limited = False
+
+        try:
+            # Step 1: 从 Syndication 获取推文 ID
+            req = urllib.request.Request(
+                f"{SYNDICATION_URL}/{handle}",
+                headers={"User-Agent": UA, "Accept": "text/html"},
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=15)
+            except urllib.error.HTTPError as http_err:
+                if http_err.code == 429:
+                    rate_limited = True
+                    _log(f"[{index+1}/{len(players)}] @{handle}: Syndication 429 限频", "warn")
+                    fail_count += 1
+                    continue
+                raise
+
+            # 成功请求后重置连续 429 计数
+            consecutive_429 = 0
+            html = resp.read().decode("utf-8", errors="replace")
+            raw_ids = list(dict.fromkeys(re.findall(r'/status/(\d{15,25})', html)))
+            # 按数值降序排序（最大 = 最新）
+            raw_ids.sort(key=lambda x: int(x), reverse=True)
+            candidate_ids = raw_ids[:MAX_IDS_PER_PLAYER]
+
+            if not candidate_ids:
+                _log(f"[{index+1}/{len(players)}] @{handle}: Syndication 未发现推文 ID", "warn")
+                fail_count += 1
+                await asyncio.sleep(SYNDICATION_DELAY)
+                continue
+
+            # Step 2: 用 fxtwitter 获取每条推文的完整数据
+            player_count = 0
+            for tid in candidate_ids:
+                try:
+                    fx_req = urllib.request.Request(
+                        f"{FXTWITTER_API}/{handle}/status/{tid}",
+                        headers={"User-Agent": UA, "Accept": "application/json"},
+                    )
+                    fx_resp = urllib.request.urlopen(fx_req, timeout=12)
+                    fx_data = json.loads(fx_resp.read().decode("utf-8", errors="replace"))
+
+                    tweet_obj = fx_data.get("tweet", {})
+                    text = (tweet_obj.get("text") or "").strip()
+                    if not text or len(text) < 5:
+                        continue
+
+                    # 解析日期
+                    tweet_date = datetime.now(timezone.utc)
+                    created_at = tweet_obj.get("created_at", "")
+                    if created_at:
+                        try:
+                            tweet_date = parsedate_to_datetime(created_at)
+                        except Exception:
+                            try:
+                                tweet_date = datetime.strptime(
+                                    created_at, "%a %b %d %H:%M:%S %z %Y"
+                                )
+                            except Exception:
+                                pass
+
+                    # 提取媒体 URL
+                    media_urls = []
+                    for m in tweet_obj.get("media", {}).get("all", []):
+                        u = m.get("url") or m.get("thumbnail_url", "")
+                        if u:
+                            media_urls.append(u)
+
+                    all_tweets.append({
+                        "tweet_id": str(tid),
+                        "player_name": player.name,
+                        "player_handle": handle,
+                        "content": text[:500],
+                        "content_cn": None,
+                        "url": f"https://x.com/{handle}/status/{tid}",
+                        "media_urls": media_urls,
+                        "cover_image_path": None,
+                        "retweet_count": int(tweet_obj.get("retweets", 0)),
+                        "like_count": int(tweet_obj.get("likes", 0)),
+                        "reply_count": int(tweet_obj.get("replies", 0)),
+                        "tweet_type": "original",
+                        "tweet_date": tweet_date.isoformat(),
+                        "scraped_at": datetime.now(timezone.utc).isoformat(),
+                        "translation_status": "pending",
+                    })
+                    player_count += 1
+                except Exception:
+                    continue  # 单条失败不影响整体
+                await asyncio.sleep(FX_DELAY)
+
+            if player_count > 0:
+                success_count += 1
+            _log(f"[{index+1}/{len(players)}] @{handle}: {player_count} 条推文")
+
+        except Exception as exc:
+            fail_count += 1
+            _log(f"[{index+1}/{len(players)}] @{handle}: 失败 ({str(exc)[:50]})", "warn")
+
+        await asyncio.sleep(SYNDICATION_DELAY)
+
+    _log(
+        f"Syndication+fxtwitter 抓取完成: 成功 {success_count}/{len(players)}, "
+        f"失败 {fail_count}, 总推文 {len(all_tweets)}"
+    )
+    return all_tweets
+
+
+async def _fetch_tweets_via_fxtwitter_refresh(players) -> list[dict]:
+    """用 fxtwitter 刷新已知推文数据（不需要 Syndication 或 token）。
+
+    从已有的 tweets.json 中提取每个球星的已知推文 ID，
+    用 fxtwitter API 逐条刷新其最新内容和数据。
+    """
+    import urllib.request
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+
+    FXTWITTER_API = "https://api.fxtwitter.com"
+    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    FX_DELAY = 0.5
+    MAX_PER_PLAYER = 3
+
+    # 从缓存中获取每个球星的已知推文 ID
+    with _tweets_lock:
+        cached = list(_tweets)
+
+    player_ids: dict[str, list[str]] = {}
+    for t in cached:
+        handle = t.get("player_handle", "")
+        tid = str(t.get("tweet_id", ""))
+        if handle and tid:
+            player_ids.setdefault(handle, []).append(tid)
+
+    # 如果没有缓存推文 ID 可用，额外从 players 列表提供一些 handles
+    if not player_ids:
+        _log("无缓存推文 ID 可供刷新，跳过 fxtwitter 模式。", "warn")
+        return []
+
+    # 对每个球星的 ID 按数值降序拿最新的
+    for handle in player_ids:
+        player_ids[handle] = sorted(
+            list(set(player_ids[handle])),
+            key=lambda x: int(x),
+            reverse=True,
+        )[:MAX_PER_PLAYER]
+
+    # 从 players 列表构建 handle -> player 映射
+    player_map = {p.handle: p for p in players}
+
+    all_tweets: list[dict] = []
+    success_count = 0
+    fail_count = 0
+
+    handles = list(player_ids.keys())
+    _log(f"使用 fxtwitter 刷新 {len(handles)} 个球星的已知推文...")
+
+    for index, handle in enumerate(handles):
+        player = player_map.get(handle)
+        player_name = player.name if player else handle
+        player_count = 0
+
+        for tid in player_ids[handle]:
+            try:
+                fx_req = urllib.request.Request(
+                    f"{FXTWITTER_API}/{handle}/status/{tid}",
+                    headers={"User-Agent": UA, "Accept": "application/json"},
+                )
+                fx_resp = urllib.request.urlopen(fx_req, timeout=12)
+                fx_data = json.loads(fx_resp.read().decode("utf-8", errors="replace"))
+
+                tweet_obj = fx_data.get("tweet", {})
+                text = (tweet_obj.get("text") or "").strip()
+                if not text or len(text) < 5:
+                    continue
+
+                tweet_date = datetime.now(timezone.utc)
+                created_at = tweet_obj.get("created_at", "")
+                if created_at:
+                    try:
+                        tweet_date = parsedate_to_datetime(created_at)
+                    except Exception:
+                        try:
+                            tweet_date = datetime.strptime(
+                                created_at, "%a %b %d %H:%M:%S %z %Y"
+                            )
+                        except Exception:
+                            pass
+
+                media_urls = []
+                media_block = tweet_obj.get("media")
+                if isinstance(media_block, dict):
+                    for m in media_block.get("all", []):
+                        u = m.get("url") or m.get("thumbnail_url", "")
+                        if u:
+                            media_urls.append(u)
+
+                all_tweets.append({
+                    "tweet_id": str(tid),
+                    "player_name": player_name,
+                    "player_handle": handle,
+                    "content": text[:500],
+                    "content_cn": None,
+                    "url": f"https://x.com/{handle}/status/{tid}",
+                    "media_urls": media_urls,
+                    "cover_image_path": None,
+                    "retweet_count": int(tweet_obj.get("retweets", 0)),
+                    "like_count": int(tweet_obj.get("likes", 0)),
+                    "reply_count": int(tweet_obj.get("replies", 0)),
+                    "tweet_type": "original",
+                    "tweet_date": tweet_date.isoformat(),
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                    "translation_status": "pending",
+                })
+                player_count += 1
+            except Exception:
+                continue
+            await asyncio.sleep(FX_DELAY)
+
+        if player_count > 0:
+            success_count += 1
+        _log(f"[{index+1}/{len(handles)}] @{handle}: {player_count} 条刷新")
+
+    _log(
+        f"fxtwitter 刷新完成: 成功 {success_count}/{len(handles)}, "
+        f"失败 {fail_count}, 总推文 {len(all_tweets)}"
+    )
+    return all_tweets
+
+
+async def _fetch_tweets_via_nitter_rss(players) -> list[dict]:
+    """兼容历史链路的 Nitter RSS 抓取，仅在显式开启时使用。"""
+    if not _is_nitter_fallback_enabled():
+        _log("已停用 Nitter 降级；如需强制尝试，请设置 TWITTER_ALLOW_NITTER_FALLBACK=1。", "warn")
+        return []
+
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    from datetime import datetime, timezone
+    from email.utils import parsedate_to_datetime
+    from html import unescape
+
+    all_tweets: list[dict] = []
+    working_instance = None
+
+    _log(f"正在检测 {len(NITTER_INSTANCES)} 个 Nitter 实例...")
+    for inst in NITTER_INSTANCES:
+        try:
+            test_req = urllib.request.Request(
+                f"{inst}/NBA/rss",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            test_resp = urllib.request.urlopen(test_req, timeout=8)
+            test_body = test_resp.read().decode("utf-8", errors="replace").strip()
+            # 验证返回的确有真实推文条目
+            if (test_resp.status == 200
+                    and len(test_body) > 500
+                    and "<item>" in test_body
+                    and "not yet whitelisted" not in test_body.lower()):
+                working_instance = inst
+                _log(f"找到可用 Nitter 实例: {inst}", "success")
+                break
+            else:
+                _log(f"实例内容无效: {inst} (len={len(test_body)})", "warn")
+        except Exception as exc:
+            _log(f"实例不可用: {inst} ({str(exc)[:40]})", "warn")
+        await asyncio.sleep(0.5)
+
+    if not working_instance:
+        _log("Nitter 降级链路不可用。", "warn")
+        return []
+
+    success_count = 0
+    fail_count = 0
+    _log(f"使用 {working_instance} 抓取 {len(players)} 个账号...")
+
+    for index, player in enumerate(players):
+        url = f"{working_instance}/{player.handle}/rss"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/rss+xml, text/xml",
+                },
+            )
+            resp = urllib.request.urlopen(req, timeout=15)
+            xml_text = resp.read().decode("utf-8", errors="replace").strip()
+
+            root = ET.fromstring(xml_text)
+            channel = root.find("channel")
+            if channel is None:
+                continue
+
+            count = 0
+            for item in channel.findall("item"):
+                link_el = item.find("link")
+                desc_el = item.find("description")
+                pub_el = item.find("pubDate")
+                link = link_el.text.strip() if link_el is not None and link_el.text else ""
+                match = re.search(r"/status/(\d+)", link)
+                if not match:
+                    continue
+
+                content = ""
+                if desc_el is not None and desc_el.text:
+                    content = re.sub(r"<br\s*/?>", "\n", desc_el.text)
+                    content = re.sub(r"<[^>]+>", "", content)
+                    content = unescape(content).strip()[:500]
+                if len(content.strip()) < 5:
+                    continue
+
+                tweet_date = datetime.now(timezone.utc)
+                if pub_el is not None and pub_el.text:
+                    try:
+                        tweet_date = parsedate_to_datetime(pub_el.text)
+                    except Exception:
+                        pass
+
+                all_tweets.append({
+                    "tweet_id": match.group(1),
+                    "player_name": player.name,
+                    "player_handle": player.handle,
+                    "content": content,
+                    "content_cn": None,
+                    "url": f"https://x.com/{player.handle}/status/{match.group(1)}",
+                    "media_urls": [],
+                    "cover_image_path": None,
+                    "retweet_count": 0,
+                    "like_count": 0,
+                    "reply_count": 0,
+                    "tweet_type": "original",
+                    "tweet_date": tweet_date.isoformat(),
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                    "translation_status": "pending",
+                })
+                count += 1
+
+            if count > 0:
+                success_count += 1
+            _log(f"[{index + 1}/{len(players)}] @{player.handle}: {count} 条推文")
+        except Exception as exc:
+            fail_count += 1
+            _log(f"[{index + 1}/{len(players)}] @{player.handle}: 失败 ({str(exc)[:40]})", "warn")
+        await asyncio.sleep(1.5)
+
+    _log(f"Nitter RSS 抓取完成: 成功 {success_count}/{len(players)}, 失败 {fail_count}, 总推文 {len(all_tweets)}")
+    return all_tweets
+
+
+def _get_available_sources() -> list[str]:
+    """返回稳定的可选来源列表。"""
+    from config.sites import SITE_CONFIGS
+
+    configured_sources = [
+        SITE_CONFIGS[key].source
+        for key in _enabled_sites
+        if key in SITE_CONFIGS and SITE_CONFIGS[key].feed_type == "rss"
+    ]
+    loaded_sources = [
+        article.get("source")
+        for article in _articles
+        if isinstance(article, dict) and article.get("source")
+    ]
+    return list(dict.fromkeys(configured_sources + loaded_sources))
+
+
+def _load_existing() -> None:
+    """从 JSON 文件加载已有数据。"""
+    global _articles, _tweets
+    if OUTPUT_FILE.exists():
+        try:
+            with open(OUTPUT_FILE, encoding="utf-8") as f:
+                _articles = json.load(f)
+        except Exception:
+            _articles = []
+    if TWEETS_FILE.exists():
+        try:
+            with open(TWEETS_FILE, encoding="utf-8") as f:
+                _tweets = json.load(f)
+        except Exception:
+            _tweets = []
+
+
+def _save_articles() -> None:
+    """保存文章到 JSON。"""
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(_articles, f, ensure_ascii=False, indent=2)
+
+
+def _run_scraper() -> None:
+    """在后台线程中运行 RSS 爬虫。"""
+    global _status, _articles
+    _status = "running"
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        articles = loop.run_until_complete(_async_scrape())
+        if articles:
+            _articles = articles
+            _save_articles()
+    except Exception as e:
+        print(f"爬虫错误: {e}")
+    finally:
+        _status = "idle"
+        _stop_event.clear()
+
+
+async def _async_scrape() -> list[dict]:
+    """异步抓取所有启用的 RSS 源。"""
+    from scraper.rss_scraper import RssScraper
+    from config.sites import SITE_CONFIGS
+    from translator.google_translator import DeepTranslatorBackend
+
+    scraper = RssScraper()
+    all_articles = []
+
+    for key in _enabled_sites:
+        if _stop_event.is_set():
+            break
+        cfg = SITE_CONFIGS.get(key)
+        if not cfg or cfg.feed_type != "rss":
+            continue
+        try:
+            articles = await scraper.fetch_rss(cfg.news_url, cfg.source)
+            all_articles.extend(articles[:20])
+        except Exception as e:
+            print(f"抓取 {cfg.name} 失败: {e}")
+
+    # 翻译
+    if all_articles and not _stop_event.is_set():
+        try:
+            backend = DeepTranslatorBackend()
+            from config.glossary import POST_TRANSLATION_FIXES
+            for i, a in enumerate(all_articles):
+                if _stop_event.is_set():
+                    break
+                try:
+                    title_cn = await backend.translate(a.get("title", ""))
+                    summary_cn = await backend.translate(a.get("summary", ""))
+                    # 应用术语后处理
+                    for wrong, right in POST_TRANSLATION_FIXES.items():
+                        title_cn = title_cn.replace(wrong, right)
+                        summary_cn = summary_cn.replace(wrong, right)
+                    a["title_cn"] = title_cn
+                    a["summary_cn"] = summary_cn
+                    a["translation_status"] = "completed"
+                except Exception:
+                    a["translation_status"] = "failed"
+        except Exception as e:
+            print(f"翻译初始化失败: {e}")
+
+    return [a if isinstance(a, dict) else a.__dict__ for a in all_articles]
+
+
+# ── 路由 ──────────────────────────────────────────────
+@app.route("/")
+def index():
+    """主页。"""
+    from config.sites import SITE_CONFIGS
+
+    rss_sites = [
+        {"key": k, "name": v.name, "source": v.source, "enabled": k in _enabled_sites}
+        for k, v in SITE_CONFIGS.items()
+        if v.feed_type == "rss"
+    ]
+    return render_template(
+        "index.html",
+        rss_sites=rss_sites,
+        available_sources=_get_available_sources(),
+    )
+
+
+@app.route("/api/status")
+def api_status():
+    """爬虫状态。"""
+    return jsonify({"status": _status, "article_count": len(_articles)})
+
+
+@app.route("/api/articles")
+def api_articles():
+    """文章列表，支持 ?source= 筛选。"""
+    source = request.args.get("source", "")
+    if source:
+        return jsonify([a for a in _articles if a.get("source") == source])
+    return jsonify(_articles)
+
+
+@app.route("/api/sources")
+def api_sources():
+    """返回稳定的来源选项。"""
+    return jsonify({"sources": _get_available_sources()})
+
+
+@app.route("/api/scrape", methods=["POST"])
+def api_scrape():
+    """启动爬虫。"""
+    global _scraper_thread, _status
+    if _status == "running":
+        return jsonify({"error": "爬虫正在运行中"}), 409
+    _stop_event.clear()
+    _scraper_thread = threading.Thread(target=_run_scraper, daemon=True)
+    _scraper_thread.start()
+    return jsonify({"status": "running", "article_count": len(_articles)})
+
+
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    """暂停爬虫。"""
+    global _status
+    if _status != "running":
+        return jsonify({"error": "爬虫未在运行"}), 409
+    _stop_event.set()
+    _status = "stopped"
+    return jsonify({"status": "stopped", "article_count": len(_articles)})
+
+
+@app.route("/api/config", methods=["POST"])
+def api_config():
+    """配置启用的数据源。"""
+    global _enabled_sites
+    from config.sites import SITE_CONFIGS
+
+    data = request.get_json(silent=True) or {}
+    sites = data.get("sites", [])
+    if not isinstance(sites, list):
+        return jsonify({"error": "sites 必须是数组"}), 400
+    invalid_sites = [site for site in sites if site not in SITE_CONFIGS]
+    if invalid_sites:
+        return jsonify({"error": f"未知站点: {', '.join(invalid_sites)}"}), 400
+    _enabled_sites = sites
+    return jsonify({"enabled": _enabled_sites, "sources": _get_available_sources()})
+
+
+@app.route("/api/tweets")
+def api_tweets():
+    """推文列表，支持 ?player= 和 ?type= 和 ?days= 筛选。按时间倒序排列。"""
+    from datetime import datetime, timezone, timedelta
+    player = request.args.get("player", "")
+    tweet_type = request.args.get("type", "")
+    days = request.args.get("days", "30")  # 默认只返回最近30天
+    filtered = list(_tweets)
+    if player:
+        filtered = [t for t in filtered if t.get("player_handle", "").lower() == player.lower()]
+    if tweet_type:
+        filtered = [t for t in filtered if t.get("tweet_type") == tweet_type]
+    # 时效性过滤：默认只返回最近 N 天的推文
+    try:
+        max_days = int(days)
+    except (ValueError, TypeError):
+        return jsonify({"error": "参数 days 必须是整数"}), 400
+    if max_days > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_days)).isoformat()
+        filtered = [t for t in filtered if t.get("tweet_date", "") >= cutoff]
+    # 按时间倒序排列（最新在前）
+    filtered.sort(key=lambda t: t.get("tweet_date", ""), reverse=True)
+    return jsonify(filtered)
+
+
+@app.route("/api/tweet-status")
+def api_tweet_status():
+    """推文爬虫状态（含最新日志）。"""
+    recent_logs = _service_logs[-10:] if _service_logs else []
+    errors = [l for l in _service_logs[-50:] if l["level"] == "error"]
+    return jsonify({
+        "status": _tweet_status,
+        "source_mode": _tweet_source_mode,
+        "source_message": _tweet_source_message,
+        "tweet_count": len(_tweets),
+        "recent_logs": recent_logs,
+        "error_count": len(errors),
+    })
+
+
+@app.route("/api/logs")
+def api_logs():
+    """返回服务运行日志。"""
+    limit = request.args.get("limit", "50")
+    try:
+        limit = min(int(limit), 200)  # 最大 200 条
+    except ValueError:
+        limit = 50
+    return jsonify(_service_logs[-limit:])
+
+
+@app.route("/api/scrape-tweets", methods=["POST"])
+def api_scrape_tweets():
+    """启动推文爬虫。"""
+    global _tweet_scraper_thread, _tweet_status
+    if _tweet_status == "running":
+        return jsonify({"error": "推文爬虫正在运行中"}), 409
+    _log("推文抓取已启动")
+    _tweet_scraper_thread = threading.Thread(target=_run_tweet_scraper, daemon=True)
+    _tweet_scraper_thread.start()
+    return jsonify({"status": "running", "tweet_count": len(_tweets)})
+
+
+def _run_tweet_scraper() -> None:
+    """在后台线程中运行推文爬虫。"""
+    global _tweet_status, _tweets
+    _tweet_status = "running"
+    _set_tweet_source("running", "正在刷新推文来源...")
+    _log("开始抓取推文...")
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        tweets = loop.run_until_complete(_async_scrape_tweets())
+        if tweets:
+            with _tweets_lock:
+                old_by_id = {t["tweet_id"]: t for t in _tweets}
+                # 合并时保留旧条目的本地媒体字段（视频、封面等）
+                LOCAL_FIELDS = ("video_url", "video_path", "video_duration",
+                                "video_resolution", "cover_image_path")
+                for t in tweets:
+                    tid = t["tweet_id"]
+                    if tid in old_by_id:
+                        old = old_by_id[tid]
+                        for field in LOCAL_FIELDS:
+                            if old.get(field) and not t.get(field):
+                                t[field] = old[field]
+                    old_by_id[tid] = t
+                _tweets.clear()
+                merged = sorted(old_by_id.values(), key=lambda t: t.get("tweet_date", ""), reverse=True)
+                _tweets.extend(merged)
+            _save_tweets()
+            if _tweet_source_mode == "cache":
+                _log(f"实时源不可用，继续显示缓存数据 {len(tweets)} 条。", "warn")
+            else:
+                _log(f"抓取完成: 获取 {len(tweets)} 条，去重后总计 {len(_tweets)} 条", "success")
+        else:
+            _log(_tweet_source_message or "抓取完成但未获取到可用推文。", "error")
+    except Exception as e:
+        import traceback
+        _set_tweet_source("failed", f"推文爬虫错误: {e}")
+        _log(f"推文爬虫错误: {e}", "error")
+        traceback.print_exc()
+    finally:
+        _tweet_status = "idle"
+
+
+def _save_tweets() -> None:
+    """保存推文到 JSON。"""
+    TWEETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(TWEETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(_tweets, f, ensure_ascii=False, indent=2)
+
+
+async def _async_scrape_tweets() -> list[dict]:
+    """抓取最新推文：官方API → Syndication+fxtwitter → Nitter RSS → 缓存回退。"""
+    from config.players import load_players
+
+    players = load_players()
+
+    # 方案 A: 官方 Twitter API v2（需要 Bearer Token）
+    all_tweets = await _fetch_tweets_via_twitter_api(players)
+    if all_tweets:
+        _set_tweet_source("api", "实时推文来自 Twitter API v2。")
+    else:
+        # 方案 B: Syndication + fxtwitter（无需 token，主要稳定源）
+        all_tweets = await _fetch_tweets_via_syndication(players)
+        if all_tweets:
+            _set_tweet_source("syndication", "实时推文来自 Syndication+fxtwitter 聚合。")
+        else:
+            # 方案 C: fxtwitter 刷新模式（用已知推文 ID 刷新数据）
+            all_tweets = await _fetch_tweets_via_fxtwitter_refresh(players)
+            if all_tweets:
+                _set_tweet_source("fxtwitter", "推文数据已通过 fxtwitter 刷新。")
+            else:
+                # 方案 D: Nitter RSS（实验性）
+                all_tweets = await _fetch_tweets_via_nitter_rss(players)
+                if all_tweets:
+                    _set_tweet_source("nitter", "实时推文来自兼容 RSS 源。")
+
+    if not all_tweets:
+        cached = _get_cached_tweets(limit=30)
+        if cached:
+            message = "外部实时源当前不可用，继续显示上次成功抓取的缓存数据。"
+            _set_tweet_source("cache", message)
+            _log(message, "warn")
+            return cached
+
+        message = "未能获取实时推文：请配置 TWITTER_BEARER_TOKEN，或稍后重试外部兼容源。"
+        _set_tweet_source("failed", message)
+        _log(message, "error")
+        return []
+
+    filtered = _filter_latest_tweets(all_tweets)
+    translated = await _translate_tweets(filtered)
+    _log(f"抓取流程完成: {len(filtered)} 条推文，{translated} 条已翻译", "success")
+    return filtered
+
+
+@app.route("/api/players")
+def api_players():
+    """返回球星列表。"""
+    try:
+        from config.players import load_players
+        players = load_players()
+        return jsonify([{"name": p.name, "handle": p.handle, "team": p.team} for p in players])
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/covers/<path:filename>")
+def serve_cover(filename):
+    """提供推文封面图片（仅允许 .jpg 文件名）。"""
+    import re
+    # 安全校验：只允许 ASCII 字母/数字/下划线/横线 + .jpg
+    if not re.fullmatch(r'[a-zA-Z0-9_\-]+\.jpg', filename):
+        from flask import abort
+        abort(404)
+    covers_dir = Path(__file__).resolve().parent.parent / "output" / "covers"
+    from flask import send_from_directory
+    return send_from_directory(str(covers_dir), filename)
+
+
+@app.route("/video/<path:filename>")
+def serve_video(filename):
+    """提供视频文件（从视频 API 输出目录）。"""
+    import re
+    from flask import abort, send_from_directory
+    # 安全校验：只允许 tweet_xxxxx.mp4 格式
+    if not re.fullmatch(r'tweet_[a-zA-Z0-9_\-]+\.mp4', filename):
+        abort(404)
+    # 视频存储目录
+    video_dir = Path("d:/vedio/output/tweet_videos")
+    if not video_dir.exists():
+        # 降级到本地 output 目录
+        video_dir = Path(__file__).resolve().parent.parent / "output" / "videos"
+    if not (video_dir / filename).exists():
+        abort(404)
+    return send_from_directory(str(video_dir), filename, mimetype="video/mp4")
+
+
+@app.route("/api/generate-videos", methods=["POST"])
+def api_generate_videos():
+    """启动视频生成流程（后台线程）。"""
+    global _video_gen_thread, _video_gen_status
+    if _video_gen_status == "running":
+        return jsonify({"error": "视频生成正在运行中"}), 409
+    _video_gen_thread = threading.Thread(target=_run_video_generation, daemon=True)
+    _video_gen_thread.start()
+    return jsonify({"status": "running"})
+
+
+@app.route("/api/video-status")
+def api_video_status():
+    """视频生成状态。"""
+    with_video = sum(1 for t in _tweets if t.get("video_url") and len(str(t.get("video_url", ""))) > 5)
+    return jsonify({
+        "status": _video_gen_status,
+        "total": len(_tweets),
+        "with_video": with_video,
+        "pending": len(_tweets) - with_video,
+    })
+
+
+_video_gen_status: str = "idle"
+_video_gen_thread: threading.Thread | None = None
+
+
+def _run_video_generation():
+    """后台执行视频生成（使用 urllib）。"""
+    global _video_gen_status, _tweets
+    _video_gen_status = "running"
+    start_time = time.time()
+    MAX_TIMEOUT = 600
+
+    try:
+        import urllib.request
+        import urllib.error
+
+        with _tweets_lock:
+            pending = [t for t in _tweets if not t.get("video_url")]
+        print(f"Video generation: {len(pending)} tweets pending")
+
+        for i, tweet in enumerate(pending):
+            if time.time() - start_time > MAX_TIMEOUT:
+                print(f"  Video generation timeout")
+                break
+
+            cover_path = tweet.get("cover_image_path", "")
+            if not cover_path:
+                continue
+            image_file = Path(__file__).resolve().parent.parent / "output" / cover_path
+            if not image_file.exists():
+                continue
+
+            content_cn = tweet.get("content_cn") or tweet.get("content", "")
+            content_en = tweet.get("content", "")
+            author = tweet.get("player_name", "")
+
+            # Build multipart with urllib
+            boundary = f"----FormBoundary{int(time.time()*1000)}"
+            body = b""
+            body += f"--{boundary}\r\n".encode()
+            body += f'Content-Disposition: form-data; name="images"; filename="{image_file.name}"\r\n'.encode()
+            body += b"Content-Type: image/jpeg\r\n\r\n"
+            body += image_file.read_bytes()
+            body += b"\r\n"
+            for key, val in [("translations", content_cn), ("authors", author), ("original_texts", content_en), ("duration", "8")]:
+                body += f"--{boundary}\r\n".encode()
+                body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+                body += val.encode("utf-8")
+                body += b"\r\n"
+            body += f"--{boundary}--\r\n".encode()
+
+            try:
+                req = urllib.request.Request(
+                    "http://localhost:8000/generate-ai",
+                    data=body,
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                    method="POST",
+                )
+                resp = urllib.request.urlopen(req, timeout=180)
+                result = json.loads(resp.read().decode("utf-8"))
+
+                with _tweets_lock:
+                    tweet["video_url"] = result.get("video_url", "")
+                    tweet["video_path"] = result.get("video_path", "")
+                    tweet["video_duration"] = result.get("duration", 0)
+                    tweet["video_resolution"] = result.get("resolution", "")
+                _save_tweets()
+                score = result.get("ai_enhanced", {}).get("review", {}).get("score", "")
+                print(f"  Video [{i+1}/{len(pending)}] @{tweet.get('player_handle')}: OK (score: {score})")
+            except urllib.error.HTTPError as e:
+                print(f"  Video [{i+1}/{len(pending)}] FAIL: HTTP {e.code}")
+            except Exception as e:
+                print(f"  Video [{i+1}/{len(pending)}] ERR: {e}")
+
+            time.sleep(2)
+
+    except Exception as e:
+        print(f"Video generation error: {e}")
+    finally:
+        _video_gen_status = "idle"
+
+
+# ── 入口 ──────────────────────────────────────────────
+def main(host: str = "127.0.0.1", port: int = 5000) -> None:
+    """启动 Web 服务。"""
+    _load_existing()
+    print(f"Basketball News Web Dashboard: http://{host}:{port}")
+    app.run(host=host, port=port)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=5000)
+    args = parser.parse_args()
+    main(host=args.host, port=args.port)
