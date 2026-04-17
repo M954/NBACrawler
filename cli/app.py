@@ -136,6 +136,7 @@ class BasketballNewsApplication:
         limit: int = 10,
         storage: str = "json",
         enable_screenshots: bool = True,
+        days: int | None = None,
     ) -> TwitterScrapeResult:
         """抓取球星推文。"""
         from browser.screenshot import PlaywrightScreenshot, StubScreenshot
@@ -155,7 +156,7 @@ class BasketballNewsApplication:
             else:
                 players = load_players()
 
-            tweets = await scraper.scrape_all(players=players, limit=limit)
+            tweets = await scraper.scrape_all(players=players, limit=limit, days=days)
 
             # 翻译推文内容
             translator = self._translator_backend
@@ -228,6 +229,7 @@ def build_parser() -> argparse.ArgumentParser:
     twitter_parser.add_argument("--limit", type=positive_int, default=10, help="每人最多推文数")
     twitter_parser.add_argument("--storage", choices=["json", "sqlite"], default="json")
     twitter_parser.add_argument("--no-screenshot", action="store_true", help="禁用截图")
+    twitter_parser.add_argument("--days", type=positive_int, default=None, help="只保留最近 N 天内的推文")
 
     translate_parser = subparsers.add_parser("translate-test", help="测试翻译")
     translate_parser.add_argument("text")
@@ -271,6 +273,7 @@ async def run_cli(
                 limit=args.limit,
                 storage=args.storage,
                 enable_screenshots=not args.no_screenshot,
+                days=args.days,
             )
             print(f"球星数: {result.player_count}")
             print(f"推文数: {result.tweet_count}")

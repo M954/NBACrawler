@@ -43,7 +43,10 @@ class PlaywrightScreenshot:
         try:
             from playwright.async_api import async_playwright
             self._pw = await async_playwright().start()
-            self._browser = await self._pw.chromium.launch(headless=self._headless)
+            self._browser = await self._pw.chromium.launch(
+                headless=self._headless,
+                channel="msedge",
+            )
             self._context = await self._browser.new_context(
                 viewport={"width": SCREENSHOT_WIDTH, "height": SCREENSHOT_HEIGHT},
                 locale="en-US",

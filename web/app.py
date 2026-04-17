@@ -29,7 +29,7 @@ _tweets_lock = threading.Lock()
 
 # ── 运行日志 ─────────────────────────────────────────
 _service_logs: list[dict] = []  # {time, level, msg}
-_MAX_LOGS = 200
+_MAX_LOGS = 500
 
 def _log(msg: str, level: str = "info"):
     """记录服务日志（线程安全）。"""
@@ -74,13 +74,18 @@ def _is_nitter_fallback_enabled() -> bool:
     }
 
 
-def _filter_latest_tweets(all_tweets: list[dict], limit: int = 30) -> list[dict]:
-    """按时间、去重和账号配额筛选最终展示推文。"""
+def _filter_latest_tweets(all_tweets: list[dict], limit: int = 30, days: int = 1) -> list[dict]:
+    """按时间、去重和账号配额筛选最终展示推文。优先最近 days 天，不足则取每人最新一条。"""
+    from datetime import datetime, timedelta, timezone
+
     media_handles = {"NBA", "ESPNNBA", "BleacherReport", "ShamsCharania"}
-    max_per_player = 3
+    max_per_player = 1
     max_media = 5
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     ranked = sorted(all_tweets, key=lambda t: t.get("tweet_date", ""), reverse=True)
+
+    # 第一轮：只取 days 天内的
     seen_ids: set[str] = set()
     player_counts: dict[str, int] = {}
     media_count = 0
@@ -91,6 +96,16 @@ def _filter_latest_tweets(all_tweets: list[dict], limit: int = 30) -> list[dict]
         handle = str(tweet.get("player_handle", "")).strip()
         if not tweet_id or not handle or tweet_id in seen_ids:
             continue
+
+        tweet_date_str = tweet.get("tweet_date", "")
+        if tweet_date_str:
+            try:
+                td = datetime.fromisoformat(str(tweet_date_str))
+                if td < cutoff:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
         if handle in media_handles:
             if media_count >= max_media:
                 continue
@@ -104,6 +119,31 @@ def _filter_latest_tweets(all_tweets: list[dict], limit: int = 30) -> list[dict]
         filtered.append(tweet)
         if len(filtered) >= limit:
             break
+
+    # 第二轮：如果 days 天内没有结果，取每人最新一条（不限日期）
+    if not filtered:
+        _log(f"最近 {days} 天无推文，回退到每人最新一条。", "warn")
+        seen_ids.clear()
+        player_counts.clear()
+        media_count = 0
+        for tweet in ranked:
+            tweet_id = str(tweet.get("tweet_id", "")).strip()
+            handle = str(tweet.get("player_handle", "")).strip()
+            if not tweet_id or not handle or tweet_id in seen_ids:
+                continue
+            if handle in media_handles:
+                if media_count >= max_media:
+                    continue
+                media_count += 1
+            else:
+                current = player_counts.get(handle, 0)
+                if current >= max_per_player:
+                    continue
+                player_counts[handle] = current + 1
+            seen_ids.add(tweet_id)
+            filtered.append(tweet)
+            if len(filtered) >= limit:
+                break
 
     _log(
         f"去重筛选: {len(all_tweets)} -> {len(filtered)} 条（球星≤{max_per_player}条/人, 媒体≤{max_media}条）"
@@ -181,7 +221,7 @@ async def _fetch_tweets_via_syndication(players) -> list[dict]:
     FXTWITTER_API = "https://api.fxtwitter.com"
     SYNDICATION_URL = "https://syndication.twitter.com/srv/timeline-profile/screen-name"
     UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    MAX_IDS_PER_PLAYER = 3  # 每人取最新 3 条 ID 尝试
+    MAX_IDS_PER_PLAYER = 1  # 每人取最新 1 条 ID
     SYNDICATION_DELAY = 3.0  # Syndication 请求间隔（避免 429）
     FX_DELAY = 0.5  # fxtwitter 请求间隔
     RETRY_DELAY = 15.0  # 429 后的等待时间
@@ -769,7 +809,7 @@ def api_tweets():
 @app.route("/api/tweet-status")
 def api_tweet_status():
     """推文爬虫状态（含最新日志）。"""
-    recent_logs = _service_logs[-10:] if _service_logs else []
+    recent_logs = _service_logs[-500:] if _service_logs else []
     errors = [l for l in _service_logs[-50:] if l["level"] == "error"]
     return jsonify({
         "status": _tweet_status,
@@ -854,31 +894,237 @@ def _save_tweets() -> None:
         json.dump(_tweets, f, ensure_ascii=False, indent=2)
 
 
+async def _fetch_and_screenshot_via_embed(players, covers_dir) -> list[dict]:
+    """通过 x.com 主页获取推文 ID，再用 embed 页面抓取内容并截图。
+
+    全程使用 Playwright 模拟有头浏览器，一次请求完成抓取+截图。
+    反爬策略：伪装浏览器指纹、随机延迟、429 退避。
+    """
+    import random
+    from datetime import datetime, timezone
+    from config.settings import get_settings
+
+    settings = get_settings()
+    covers_dir = settings.output_dir / "covers"
+    covers_dir.mkdir(parents=True, exist_ok=True)
+
+    UA_LIST = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    ]
+    PROFILE_DELAY_MIN = 5.0
+    PROFILE_DELAY_MAX = 10.0
+    EMBED_DELAY_MIN = 3.0
+    EMBED_DELAY_MAX = 6.0
+    MAX_IDS_PER_PLAYER = 1
+    PROFILE_LOAD_WAIT = 8  # 等待 x.com 主页渲染的秒数
+
+    all_tweets = []
+    pw_instance = None
+    browser = None
+
+    _log(f"使用 x.com+Embed 抓取 {len(players)} 个账号...")
+
+    try:
+        from playwright.async_api import async_playwright
+        pw_instance = await async_playwright().start()
+        browser = await pw_instance.chromium.launch(
+            headless=True,
+            channel="msedge",
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+
+        for index, player in enumerate(players):
+            handle = player.handle
+            _log(f"[{index+1}/{len(players)}] @{handle}: 访问主页...")
+
+            try:
+                # Step 1: 打开 x.com 主页，提取推文 ID
+                ua = random.choice(UA_LIST)
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    user_agent=ua,
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                )
+                await context.add_init_script(
+                    'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
+                )
+                page = await context.new_page()
+
+                await page.goto(
+                    f"https://x.com/{handle}",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                await asyncio.sleep(PROFILE_LOAD_WAIT)
+
+                # 从页面链接提取推文 ID
+                links = await page.query_selector_all('a[href*="/status/"]')
+                tweet_ids = []
+                seen = set()
+                for link in links:
+                    href = await link.get_attribute("href")
+                    if href and "/status/" in href:
+                        parts = href.split("/status/")
+                        if len(parts) > 1:
+                            tid = parts[1].split("/")[0].split("?")[0]
+                            if tid.isdigit() and len(tid) > 10 and tid not in seen:
+                                seen.add(tid)
+                                tweet_ids.append(tid)
+
+                await page.close()
+                await context.close()
+
+                # 按 ID 降序（最新优先），取前 N 条
+                tweet_ids.sort(key=lambda x: int(x), reverse=True)
+                tweet_ids = tweet_ids[:MAX_IDS_PER_PLAYER]
+
+                if not tweet_ids:
+                    _log(f"[{index+1}/{len(players)}] @{handle}: 未发现推文 ID", "warn")
+                    delay = random.uniform(PROFILE_DELAY_MIN, PROFILE_DELAY_MAX)
+                    await asyncio.sleep(delay)
+                    continue
+
+                _log(f"[{index+1}/{len(players)}] @{handle}: 发现 {len(tweet_ids)} 条推文 ID")
+
+                # Step 2: 用 embed 页面抓取内容并截图
+                for tid in tweet_ids:
+                    try:
+                        embed_page = await browser.new_page(
+                            viewport={"width": 550, "height": 800}
+                        )
+                        embed_url = f"https://platform.twitter.com/embed/Tweet.html?id={tid}"
+                        await embed_page.goto(
+                            embed_url, wait_until="networkidle", timeout=30000
+                        )
+                        await embed_page.wait_for_selector("article", timeout=15000)
+
+                        # 提取推文文字
+                        text_el = await embed_page.query_selector(
+                            '[data-testid="tweetText"]'
+                        )
+                        text = (
+                            (await text_el.inner_text()).strip() if text_el else ""
+                        )
+
+                        if not text or len(text) < 5:
+                            _log(f"推文 {tid} 文字过短，跳过", "warn")
+                            await embed_page.close()
+                            continue
+
+                        # 提取时间
+                        tweet_date = datetime.now(timezone.utc).isoformat()
+                        time_el = await embed_page.query_selector("time")
+                        if time_el:
+                            dt_attr = await time_el.get_attribute("datetime")
+                            if dt_attr:
+                                tweet_date = dt_attr
+
+                        # 截图
+                        output_path = covers_dir / f"{tid}.jpg"
+                        cover_path = None
+                        if not (
+                            output_path.exists() and output_path.stat().st_size > 0
+                        ):
+                            await embed_page.screenshot(
+                                path=str(output_path),
+                                type="jpeg",
+                                quality=85,
+                                full_page=True,
+                            )
+                        cover_path = f"covers/{tid}.jpg"
+
+                        await embed_page.close()
+
+                        tweet_data = {
+                            "tweet_id": str(tid),
+                            "player_name": player.name,
+                            "player_handle": player.handle,
+                            "content": text[:500],
+                            "content_cn": None,
+                            "url": f"https://x.com/{player.handle}/status/{tid}",
+                            "media_urls": [],
+                            "cover_image_path": cover_path,
+                            "retweet_count": 0,
+                            "like_count": 0,
+                            "reply_count": 0,
+                            "tweet_type": "original",
+                            "tweet_date": tweet_date,
+                            "scraped_at": datetime.now(timezone.utc).isoformat(),
+                            "translation_status": "pending",
+                        }
+                        all_tweets.append(tweet_data)
+                        _log(f"推文+截图成功: @{player.handle} #{tid}")
+
+                    except Exception as exc:
+                        _log(f"Embed 抓取失败 {tid}: {str(exc)[:80]}", "warn")
+                        try:
+                            await embed_page.close()
+                        except Exception:
+                            pass
+
+                    delay = random.uniform(EMBED_DELAY_MIN, EMBED_DELAY_MAX)
+                    await asyncio.sleep(delay)
+
+            except Exception as exc:
+                _log(
+                    f"[{index+1}/{len(players)}] @{handle}: 失败 ({str(exc)[:80]})",
+                    "warn",
+                )
+
+            delay = random.uniform(PROFILE_DELAY_MIN, PROFILE_DELAY_MAX)
+            await asyncio.sleep(delay)
+
+    except Exception as exc:
+        _log(f"Playwright 初始化失败: {exc}", "error")
+    finally:
+        if browser:
+            await browser.close()
+        if pw_instance:
+            await pw_instance.stop()
+
+    _log(
+        f"x.com+Embed 抓取完成: 共 {len(all_tweets)} 条推文+截图",
+        "success" if all_tweets else "warn",
+    )
+    return all_tweets
+
+
 async def _async_scrape_tweets() -> list[dict]:
-    """抓取最新推文：官方API → Syndication+fxtwitter → Nitter RSS → 缓存回退。"""
+    """抓取最新推文：Embed（抓取+截图一体）→ 其他降级方案 → 缓存回退。"""
     from config.players import load_players
+    from config.settings import get_settings
 
     players = load_players()
+    settings = get_settings()
+    covers_dir = settings.output_dir / "covers"
 
     # 方案 A: 官方 Twitter API v2（需要 Bearer Token）
     all_tweets = await _fetch_tweets_via_twitter_api(players)
     if all_tweets:
         _set_tweet_source("api", "实时推文来自 Twitter API v2。")
     else:
-        # 方案 B: Syndication + fxtwitter（无需 token，主要稳定源）
-        all_tweets = await _fetch_tweets_via_syndication(players)
+        # 方案 B: Syndication + Embed（抓取内容并同时截图，一次完成）
+        all_tweets = await _fetch_and_screenshot_via_embed(players, covers_dir)
         if all_tweets:
-            _set_tweet_source("syndication", "实时推文来自 Syndication+fxtwitter 聚合。")
+            _set_tweet_source("embed", "实时推文来自 Syndication+Embed 聚合（含截图）。")
         else:
-            # 方案 C: fxtwitter 刷新模式（用已知推文 ID 刷新数据）
-            all_tweets = await _fetch_tweets_via_fxtwitter_refresh(players)
+            # 方案 C: Syndication + fxtwitter（无截图降级）
+            all_tweets = await _fetch_tweets_via_syndication(players)
             if all_tweets:
-                _set_tweet_source("fxtwitter", "推文数据已通过 fxtwitter 刷新。")
+                _set_tweet_source("syndication", "实时推文来自 Syndication+fxtwitter 聚合。")
             else:
-                # 方案 D: Nitter RSS（实验性）
-                all_tweets = await _fetch_tweets_via_nitter_rss(players)
+                # 方案 D: fxtwitter 刷新模式
+                all_tweets = await _fetch_tweets_via_fxtwitter_refresh(players)
                 if all_tweets:
-                    _set_tweet_source("nitter", "实时推文来自兼容 RSS 源。")
+                    _set_tweet_source("fxtwitter", "推文数据已通过 fxtwitter 刷新。")
+                else:
+                    # 方案 E: Nitter RSS（实验性）
+                    all_tweets = await _fetch_tweets_via_nitter_rss(players)
+                    if all_tweets:
+                        _set_tweet_source("nitter", "实时推文来自兼容 RSS 源。")
 
     if not all_tweets:
         cached = _get_cached_tweets(limit=30)
@@ -895,6 +1141,7 @@ async def _async_scrape_tweets() -> list[dict]:
 
     filtered = _filter_latest_tweets(all_tweets)
     translated = await _translate_tweets(filtered)
+
     _log(f"抓取流程完成: {len(filtered)} 条推文，{translated} 条已翻译", "success")
     return filtered
 

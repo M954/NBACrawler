@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import os
 import re
-from datetime import datetime, timezone
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -53,6 +57,7 @@ class TwitterScraper:
         self._enable_screenshots = enable_screenshots
         self._settings = get_settings()
         self._covers_dir = self._settings.output_dir / "covers"
+        self._syndication_lock = asyncio.Lock()
 
     async def scrape_player(
         self,
@@ -72,7 +77,16 @@ class TwitterScraper:
                 logger.warning("API 抓取 @%s 失败: %s，降级到 Nitter", player.handle, exc)
                 tweets = []
 
-        # 方案 B：Nitter 降级
+        # 方案 B：Syndication + fxtwitter（无需 token）
+        if not tweets:
+            try:
+                tweets = await self._fetch_via_syndication(player, limit)
+                if tweets:
+                    logger.info("Syndication+fxtwitter 抓取 @%s 成功: %d 条", player.handle, len(tweets))
+            except Exception as exc:
+                logger.warning("Syndication+fxtwitter @%s 失败: %s，降级到 Nitter", player.handle, exc)
+
+        # 方案 C：Nitter 降级
         if not tweets:
             tweets = await self._fetch_via_nitter(player, limit)
 
@@ -86,8 +100,13 @@ class TwitterScraper:
         self,
         players: list[PlayerConfig] | None = None,
         limit: int = 10,
+        days: int | None = None,
     ) -> list[Tweet]:
-        """抓取所有球星的推文（带并发控制）。"""
+        """抓取所有球星的推文（带并发控制）。
+
+        Args:
+            days: 只保留最近 N 天内的推文，None 表示不过滤。
+        """
         if players is None:
             players = load_players()
 
@@ -107,6 +126,13 @@ class TwitterScraper:
         results = await asyncio.gather(*[_scrape_one(p) for p in players])
         for tweets in results:
             all_tweets.extend(tweets)
+
+        if days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            before = len(all_tweets)
+            all_tweets = [t for t in all_tweets if t.tweet_date >= cutoff]
+            logger.info("日期过滤: %d → %d 条（最近 %d 天）", before, len(all_tweets), days)
+
         return all_tweets
 
     # ── Twitter API v2 ────────────────────────────────
@@ -205,6 +231,102 @@ class TwitterScraper:
                 reply_count=metrics.get("reply_count", 0),
                 tweet_type=tweet_type,
             ))
+
+        return tweets
+
+    # ── Syndication + fxtwitter ─────────────────────────
+
+    SYNDICATION_URL = "https://syndication.twitter.com/srv/timeline-profile/screen-name"
+    FXTWITTER_API = "https://api.fxtwitter.com"
+    SYNDICATION_DELAY = 3.0
+    FX_DELAY = 0.5
+
+    async def _fetch_via_syndication(self, player: PlayerConfig, limit: int) -> list[Tweet]:
+        """通过 Syndication 获取推文 ID，再用 fxtwitter 拉取完整内容。"""
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        max_ids = min(limit, 5)
+
+        # 串行化 syndication 请求避免 429
+        async with self._syndication_lock:
+            # Step 1: Syndication 获取推文 ID（带 429 重试）
+            html = None
+            for attempt in range(3):
+                req = urllib.request.Request(
+                    f"{self.SYNDICATION_URL}/{player.handle}",
+                    headers={"User-Agent": ua, "Accept": "text/html"},
+                )
+                try:
+                    resp = urllib.request.urlopen(req, timeout=15)
+                    html = resp.read().decode("utf-8", errors="replace")
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code == 429:
+                        wait = (attempt + 1) * 10
+                        logger.warning("Syndication @%s 429，等待 %ds 重试...", player.handle, wait)
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+            if html is None:
+                return []
+
+            await asyncio.sleep(self.SYNDICATION_DELAY)
+        raw_ids = list(dict.fromkeys(re.findall(r'/status/(\d{15,25})', html)))
+        raw_ids.sort(key=lambda x: int(x), reverse=True)
+        candidate_ids = raw_ids[:max_ids]
+
+        if not candidate_ids:
+            return []
+
+        # Step 2: fxtwitter 获取每条推文完整数据
+        tweets: list[Tweet] = []
+        for tid in candidate_ids:
+            try:
+                fx_req = urllib.request.Request(
+                    f"{self.FXTWITTER_API}/{player.handle}/status/{tid}",
+                    headers={"User-Agent": ua, "Accept": "application/json"},
+                )
+                fx_resp = urllib.request.urlopen(fx_req, timeout=12)
+                fx_data = json.loads(fx_resp.read().decode("utf-8", errors="replace"))
+
+                tweet_obj = fx_data.get("tweet", {})
+                text = (tweet_obj.get("text") or "").strip()
+                if not text or len(text) < 5:
+                    continue
+
+                tweet_date = datetime.now(timezone.utc)
+                created_at = tweet_obj.get("created_at", "")
+                if created_at:
+                    try:
+                        tweet_date = parsedate_to_datetime(created_at)
+                    except Exception:
+                        try:
+                            tweet_date = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+                        except Exception:
+                            pass
+
+                media_urls: list[str] = []
+                for m in tweet_obj.get("media", {}).get("all", []):
+                    u = m.get("url") or m.get("thumbnail_url", "")
+                    if u:
+                        media_urls.append(u)
+
+                tweets.append(Tweet(
+                    tweet_id=str(tid),
+                    player_name=player.name,
+                    player_handle=player.handle,
+                    content=text[:500],
+                    url=f"https://x.com/{player.handle}/status/{tid}",
+                    tweet_date=tweet_date,
+                    media_urls=media_urls,
+                    retweet_count=int(tweet_obj.get("retweets", 0)),
+                    like_count=int(tweet_obj.get("likes", 0)),
+                    reply_count=int(tweet_obj.get("replies", 0)),
+                    tweet_type="original",
+                ))
+            except Exception as exc:
+                logger.debug("fxtwitter 获取推文 %s 失败: %s", tid, exc)
+                continue
+            await asyncio.sleep(self.FX_DELAY)
 
         return tweets
 
