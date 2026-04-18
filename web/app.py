@@ -1171,7 +1171,13 @@ async def _background_screenshot(tweets, covers_dir) -> None:
         if pw_instance:
             await pw_instance.stop()
 
-    # 截图完成后重新保存 JSON（更新 cover_image_path）
+    # 截图完成后同步到全局 _tweets 并保存 JSON
+    with _tweets_lock:
+        tweets_by_id = {t["tweet_id"]: t for t in tweets if t.get("cover_image_path")}
+        for t in _tweets:
+            tid = t.get("tweet_id")
+            if tid in tweets_by_id:
+                t["cover_image_path"] = tweets_by_id[tid]["cover_image_path"]
     _save_tweets()
     _log(f"后台截图完成: {screenshot_count}/{total} 张", "success" if screenshot_count else "warn")
 
