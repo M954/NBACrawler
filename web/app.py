@@ -25,6 +25,7 @@ _enabled_sites: list[str] = ["yahoo_nba", "espn_nba", "cbs_nba"]
 _scraper_thread: threading.Thread | None = None
 _tweet_scraper_thread: threading.Thread | None = None
 _stop_event = threading.Event()
+_tweet_stop_event = threading.Event()
 _tweets_lock = threading.Lock()
 
 # ── 运行日志 ─────────────────────────────────────────
@@ -838,10 +839,23 @@ def api_scrape_tweets():
     global _tweet_scraper_thread, _tweet_status
     if _tweet_status == "running":
         return jsonify({"error": "推文爬虫正在运行中"}), 409
+    _tweet_stop_event.clear()
     _log("推文抓取已启动")
     _tweet_scraper_thread = threading.Thread(target=_run_tweet_scraper, daemon=True)
     _tweet_scraper_thread.start()
     return jsonify({"status": "running", "tweet_count": len(_tweets)})
+
+
+@app.route("/api/stop-tweets", methods=["POST"])
+def api_stop_tweets():
+    """停止推文爬虫。"""
+    global _tweet_status
+    if _tweet_status != "running":
+        return jsonify({"error": "推文爬虫未在运行"}), 409
+    _tweet_stop_event.set()
+    _tweet_status = "idle"
+    _log("推文抓取已请求停止。", "warn")
+    return jsonify({"status": "stopped"})
 
 
 def _run_tweet_scraper() -> None:

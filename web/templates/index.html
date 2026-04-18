@@ -215,19 +215,20 @@
 
     /* 推文爬虫 */
     async function startTweetScraper(){try{const r=await fetch('/api/scrape-tweets',{method:'POST'});const d=await r.json();if(!r.ok){toast(d.error,'error');return;}document.getElementById('btn-scrape').disabled=true;document.getElementById('btn-scrape').textContent='⏳ 抓取中...';document.getElementById('btn-stop-scrape').style.display='';document.getElementById('log-panel').style.display='block';document.getElementById('log-content').innerHTML='<div style="color:var(--text-muted)">正在启动抓取...</div>';toast('推文爬虫已启动','success');if(!_tPoll)_tPoll=setInterval(pollTweet,3000);}catch(e){toast('失败','error');}}
-    async function stopTweetScraper(){try{await fetch('/api/stop',{method:'POST'});document.getElementById('btn-stop-scrape').style.display='none';toast('已请求停止抓取','info');}catch{}}
+    async function stopTweetScraper(){try{await fetch('/api/stop-tweets',{method:'POST'});document.getElementById('btn-stop-scrape').style.display='none';document.getElementById('btn-scrape').disabled=false;document.getElementById('btn-scrape').textContent='🐦 抓取推文';toast('已请求停止抓取','info');}catch{}}
     async function pollTweet(){
       try{
         const r=await fetch('/api/tweet-status');
         const d=await r.json();
         // 更新日志面板
         updateLogPanel(d.recent_logs, d.error_count);
+        // 实时刷新推文列表
+        await loadTweets();
         if(d.status==='idle'){
           document.getElementById('btn-scrape').disabled=false;
           document.getElementById('btn-scrape').textContent='🐦 抓取推文';
           document.getElementById('btn-stop-scrape').style.display='none';
           if(_tPoll){clearInterval(_tPoll);_tPoll=null;}
-          await loadTweets();
           if(d.source_mode==='cache'){
             toast(d.source_message||'实时源不可用，当前显示缓存数据','warning');
           } else if(d.error_count>0){
@@ -237,6 +238,25 @@
           } else {
             toast(d.source_message||'抓取完成但未获取到新推文，请检查实时源状态','warning');
           }
+        }
+      }catch{}
+    }
+    // 页面加载时检查抓取状态，恢复 UI
+    async function checkTweetStatus(){
+      try{
+        const r=await fetch('/api/tweet-status');
+        const d=await r.json();
+        if(d.status==='running'){
+          document.getElementById('btn-scrape').disabled=true;
+          document.getElementById('btn-scrape').textContent='⏳ 抓取中...';
+          document.getElementById('btn-stop-scrape').style.display='';
+          document.getElementById('log-panel').style.display='block';
+          updateLogPanel(d.recent_logs, d.error_count);
+          if(!_tPoll)_tPoll=setInterval(pollTweet,3000);
+        } else if(d.recent_logs && d.recent_logs.length>0){
+          // 显示上次的日志
+          document.getElementById('log-panel').style.display='block';
+          updateLogPanel(d.recent_logs, d.error_count);
         }
       }catch{}
     }
@@ -264,7 +284,7 @@
     /* 资讯 */
     async function loadArticles(){try{const r=await fetch('/api/articles');if(!r.ok)return;_articles=await r.json();const c=document.getElementById('article-list');c.className='article-grid';if(!_articles.length){c.innerHTML='<div class="empty-state"><div class="empty-icon">📭</div><p>暂无资讯</p></div>';return;}c.innerHTML=_articles.slice(0,20).map((a,i)=>`<article class="article-card" style="--i:${i}"><div class="card-top"><span class="source-badge">${esc(a.source)}</span></div><h2 class="title-cn">${esc(a.title_cn||a.title)}</h2><p class="title-en">${esc(a.title)}</p><p class="summary">${esc(a.summary_cn||a.summary||'')}</p><div class="card-footer"><span class="date">🕐 ${ago(a.publish_date)}</span><a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer" class="read-link">阅读原文 →</a></div></article>`).join('');document.getElementById('stat-total').textContent=_articles.length;document.getElementById('stat-translated').textContent=_articles.filter(a=>a.translation_status==='completed').length;document.getElementById('stat-sources').textContent=new Set(_articles.map(a=>a.source)).size;}catch{}}
 
-    document.addEventListener('DOMContentLoaded',()=>{loadTweets();loadPlayers();});
+    document.addEventListener('DOMContentLoaded',()=>{loadTweets();loadPlayers();checkTweetStatus();});
   </script>
 </body>
 </html>
