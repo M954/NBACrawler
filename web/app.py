@@ -19,6 +19,7 @@ _articles: list[dict] = []
 _tweets: list[dict] = []
 _status: str = "idle"  # idle / running / stopped
 _tweet_status: str = "idle"  # idle / running
+_screenshot_status: str = "idle"  # idle / running
 _tweet_source_mode: str = "idle"  # idle / api / nitter / cache / failed
 _tweet_source_message: str = ""
 _enabled_sites: list[str] = ["yahoo_nba", "espn_nba", "cbs_nba"]
@@ -814,6 +815,7 @@ def api_tweet_status():
     errors = [l for l in _service_logs[-50:] if l["level"] == "error"]
     return jsonify({
         "status": _tweet_status,
+        "screenshot_status": _screenshot_status,
         "source_mode": _tweet_source_mode,
         "source_message": _tweet_source_message,
         "tweet_count": len(_tweets),
@@ -909,9 +911,8 @@ def _save_tweets() -> None:
 
 
 async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
-    """通过 Nitter RSS 获取最新推文，逐条：抓取→翻译→保存→异步截图。
+    """通过 Nitter RSS 获取最新推文，逐条：抓取→翻译→保存→异步截图（与下一条抓取并行）。
 
-    截图不阻塞主流程，在后台并行执行。
     反爬策略：多实例轮换、UA轮换、随机延迟、429退避、连续失败熔断。
     """
     import random
@@ -921,6 +922,7 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
     import urllib.request
     import urllib.error
     from config.settings import get_settings
+    global _screenshot_status
 
     settings = get_settings()
     covers_dir = settings.output_dir / "covers"
@@ -956,164 +958,233 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
     except Exception as exc:
         _log(f"翻译器初始化失败: {exc}", "error")
 
+    # 初始化 Playwright（后台截图共享）
+    pw_instance = None
+    browser = None
+    try:
+        from playwright.async_api import async_playwright
+        pw_instance = await async_playwright().start()
+        browser = await pw_instance.chromium.launch(
+            headless=True, channel="msedge",
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        _log("Playwright 已启动（截图与抓取并行）。")
+    except Exception as exc:
+        _log(f"Playwright 初始化失败，截图将被跳过: {exc}", "warn")
+
     all_tweets = []
+    screenshot_tasks = []  # 收集异步截图任务
     consecutive_fail = 0
     current_instance_idx = 0
     translated_count = 0
+    _screenshot_status = "running" if browser else "idle"
 
-    _log(f"使用 NitterRSS 抓取 {len(players)} 个账号（逐条翻译，异步截图）...")
+    _log(f"使用 NitterRSS 抓取 {len(players)} 个账号（抓取+截图并行）...")
 
-    for index, player in enumerate(players):
-        handle = player.handle
-
-        if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
-            _log(f"连续 {consecutive_fail} 次 RSS 失败，熔断停止。", "warn")
-            break
-
-        fetched = False
-        tried_instances = 0
-
-        while tried_instances < len(NITTER_RSS_INSTANCES):
-            instance = NITTER_RSS_INSTANCES[current_instance_idx % len(NITTER_RSS_INSTANCES)]
-            try:
-                ua = random.choice(UA_LIST)
-                rss_url = f"{instance}/{handle}/rss"
-                req = urllib.request.Request(rss_url, headers={
-                    "User-Agent": ua,
-                    "Accept": "application/rss+xml, application/xml, text/xml",
-                })
-                resp = urllib.request.urlopen(req, timeout=15)
-                data = resp.read().decode("utf-8", errors="replace")
-                root = ElementTree.fromstring(data)
-                items = root.findall(".//item")
-
-                player_count = 0
-                for item in items:
-                    if player_count >= MAX_PER_PLAYER:
+    async def _screenshot_one(tid, covers_dir, browser):
+        """单条推文异步截图。"""
+        import random
+        output_path = covers_dir / f"{tid}.jpg"
+        if output_path.exists() and output_path.stat().st_size > 0:
+            with _tweets_lock:
+                for t in _tweets:
+                    if t.get("tweet_id") == tid:
+                        t["cover_image_path"] = f"covers/{tid}.jpg"
                         break
+            _save_tweets()
+            return
 
-                    link = item.find("link")
-                    link_text = link.text.strip() if link is not None and link.text else ""
-                    if "/status/" not in link_text:
-                        continue
-                    tid = link_text.split("/status/")[-1].split("#")[0].split("?")[0]
-                    if not tid.isdigit():
-                        continue
+        try:
+            page = await browser.new_page(viewport={"width": 550, "height": 800})
+            embed_url = f"https://platform.twitter.com/embed/Tweet.html?id={tid}"
+            await page.goto(embed_url, wait_until="networkidle", timeout=30000)
+            await page.wait_for_selector("article", timeout=15000)
+            await page.screenshot(
+                path=str(output_path), type="jpeg", quality=85, full_page=True,
+            )
+            await page.close()
+            with _tweets_lock:
+                for t in _tweets:
+                    if t.get("tweet_id") == tid:
+                        t["cover_image_path"] = f"covers/{tid}.jpg"
+                        break
+            _save_tweets()
+            _log(f"截图完成: {tid}")
+        except Exception as exc:
+            _log(f"截图失败 {tid}: {str(exc)[:60]}", "warn")
+            try:
+                await page.close()
+            except Exception:
+                pass
 
-                    title_el = item.find("title")
-                    title_text = title_el.text.strip() if title_el is not None and title_el.text else ""
+    try:
+        for index, player in enumerate(players):
+            handle = player.handle
 
-                    if title_text.startswith("RT by"):
-                        continue
-
-                    content = title_text
-                    if not content or len(content) < 5:
-                        continue
-
-                    pubdate_el = item.find("pubDate")
-                    tweet_date = datetime.now(timezone.utc).isoformat()
-                    if pubdate_el is not None and pubdate_el.text:
-                        try:
-                            tweet_date = parsedate_to_datetime(pubdate_el.text.strip()).isoformat()
-                        except Exception:
-                            pass
-
-                    # 1. 翻译
-                    content_cn = None
-                    translation_status = "pending"
-                    if translator_backend and expand_twitter_slang:
-                        try:
-                            text_expanded = expand_twitter_slang(content)
-                            content_cn = await translator_backend.translate(text_expanded)
-                            for wrong, right in POST_TRANSLATION_FIXES.items():
-                                content_cn = content_cn.replace(wrong, right)
-                            translation_status = "completed"
-                            translated_count += 1
-                        except Exception:
-                            translation_status = "failed"
-
-                    # 2. 组装数据
-                    tweet_data = {
-                        "tweet_id": str(tid),
-                        "player_name": player.name,
-                        "player_handle": handle,
-                        "content": content[:500],
-                        "content_cn": content_cn,
-                        "url": f"https://x.com/{handle}/status/{tid}",
-                        "media_urls": [],
-                        "cover_image_path": None,
-                        "retweet_count": 0,
-                        "like_count": 0,
-                        "reply_count": 0,
-                        "tweet_type": "original",
-                        "tweet_date": tweet_date,
-                        "scraped_at": datetime.now(timezone.utc).isoformat(),
-                        "translation_status": translation_status,
-                    }
-                    all_tweets.append(tweet_data)
-                    player_count += 1
-
-                    _log(f"[{index+1}/{len(players)}] @{handle}: 抓取+翻译({translation_status}) 完成")
-
-                    # 3. 实时保存
-                    with _tweets_lock:
-                        old_by_id = {t["tweet_id"]: t for t in _tweets}
-                        old_by_id[tweet_data["tweet_id"]] = tweet_data
-                        _tweets.clear()
-                        merged = sorted(old_by_id.values(), key=lambda t: t.get("tweet_date", ""), reverse=True)
-                        _tweets.extend(merged)
-                    _save_tweets()
-
-                if player_count > 0:
-                    fetched = True
-                    consecutive_fail = 0
-                else:
-                    _log(f"[{index+1}/{len(players)}] @{handle}: RSS 无可用推文 ({instance})", "warn")
-
+            if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
+                _log(f"连续 {consecutive_fail} 次 RSS 失败，熔断停止。", "warn")
                 break
 
-            except urllib.error.HTTPError as http_err:
-                if http_err.code == 429:
-                    _log(f"[{index+1}/{len(players)}] @{handle}: {instance} 429 限频，切换实例...", "warn")
+            fetched = False
+            tried_instances = 0
+
+            while tried_instances < len(NITTER_RSS_INSTANCES):
+                instance = NITTER_RSS_INSTANCES[current_instance_idx % len(NITTER_RSS_INSTANCES)]
+                try:
+                    ua = random.choice(UA_LIST)
+                    rss_url = f"{instance}/{handle}/rss"
+                    req = urllib.request.Request(rss_url, headers={
+                        "User-Agent": ua,
+                        "Accept": "application/rss+xml, application/xml, text/xml",
+                    })
+                    resp = urllib.request.urlopen(req, timeout=15)
+                    data = resp.read().decode("utf-8", errors="replace")
+                    root = ElementTree.fromstring(data)
+                    items = root.findall(".//item")
+
+                    player_count = 0
+                    for item in items:
+                        if player_count >= MAX_PER_PLAYER:
+                            break
+
+                        link = item.find("link")
+                        link_text = link.text.strip() if link is not None and link.text else ""
+                        if "/status/" not in link_text:
+                            continue
+                        tid = link_text.split("/status/")[-1].split("#")[0].split("?")[0]
+                        if not tid.isdigit():
+                            continue
+
+                        title_el = item.find("title")
+                        title_text = title_el.text.strip() if title_el is not None and title_el.text else ""
+
+                        if title_text.startswith("RT by"):
+                            continue
+
+                        content = title_text
+                        if not content or len(content) < 5:
+                            continue
+
+                        pubdate_el = item.find("pubDate")
+                        tweet_date = datetime.now(timezone.utc).isoformat()
+                        if pubdate_el is not None and pubdate_el.text:
+                            try:
+                                tweet_date = parsedate_to_datetime(pubdate_el.text.strip()).isoformat()
+                            except Exception:
+                                pass
+
+                        # 1. 翻译
+                        content_cn = None
+                        translation_status = "pending"
+                        if translator_backend and expand_twitter_slang:
+                            try:
+                                text_expanded = expand_twitter_slang(content)
+                                content_cn = await translator_backend.translate(text_expanded)
+                                for wrong, right in POST_TRANSLATION_FIXES.items():
+                                    content_cn = content_cn.replace(wrong, right)
+                                translation_status = "completed"
+                                translated_count += 1
+                            except Exception:
+                                translation_status = "failed"
+
+                        # 2. 组装数据
+                        tweet_data = {
+                            "tweet_id": str(tid),
+                            "player_name": player.name,
+                            "player_handle": handle,
+                            "content": content[:500],
+                            "content_cn": content_cn,
+                            "url": f"https://x.com/{handle}/status/{tid}",
+                            "media_urls": [],
+                            "cover_image_path": None,
+                            "retweet_count": 0,
+                            "like_count": 0,
+                            "reply_count": 0,
+                            "tweet_type": "original",
+                            "tweet_date": tweet_date,
+                            "scraped_at": datetime.now(timezone.utc).isoformat(),
+                            "translation_status": translation_status,
+                        }
+                        all_tweets.append(tweet_data)
+                        player_count += 1
+
+                        _log(f"[{index+1}/{len(players)}] @{handle}: 抓取+翻译({translation_status}) 完成")
+
+                        # 3. 实时保存
+                        with _tweets_lock:
+                            old_by_id = {t["tweet_id"]: t for t in _tweets}
+                            old_by_id[tweet_data["tweet_id"]] = tweet_data
+                            _tweets.clear()
+                            merged = sorted(old_by_id.values(), key=lambda t: t.get("tweet_date", ""), reverse=True)
+                            _tweets.extend(merged)
+                        _save_tweets()
+
+                        # 4. 异步提交截图（不等待，与下一条抓取并行）
+                        if browser:
+                            task = asyncio.ensure_future(_screenshot_one(tid, covers_dir, browser))
+                            screenshot_tasks.append(task)
+
+                    if player_count > 0:
+                        fetched = True
+                        consecutive_fail = 0
+                    else:
+                        _log(f"[{index+1}/{len(players)}] @{handle}: RSS 无可用推文 ({instance})", "warn")
+
+                    break
+
+                except urllib.error.HTTPError as http_err:
+                    if http_err.code == 429:
+                        _log(f"[{index+1}/{len(players)}] @{handle}: {instance} 429 限频，切换实例...", "warn")
+                        current_instance_idx += 1
+                        tried_instances += 1
+                        await asyncio.sleep(RSS_429_DELAY)
+                        continue
+                    else:
+                        _log(f"[{index+1}/{len(players)}] @{handle}: {instance} HTTP {http_err.code}", "warn")
+                        current_instance_idx += 1
+                        tried_instances += 1
+                        continue
+
+                except Exception as exc:
+                    _log(f"[{index+1}/{len(players)}] @{handle}: {instance} 失败 ({str(exc)[:50]})", "warn")
                     current_instance_idx += 1
                     tried_instances += 1
-                    await asyncio.sleep(RSS_429_DELAY)
-                    continue
-                else:
-                    _log(f"[{index+1}/{len(players)}] @{handle}: {instance} HTTP {http_err.code}", "warn")
-                    current_instance_idx += 1
-                    tried_instances += 1
                     continue
 
-            except Exception as exc:
-                _log(f"[{index+1}/{len(players)}] @{handle}: {instance} 失败 ({str(exc)[:50]})", "warn")
-                current_instance_idx += 1
-                tried_instances += 1
-                continue
+            if not fetched:
+                consecutive_fail += 1
+                _log(f"[{index+1}/{len(players)}] @{handle}: 所有实例均失败 (连续失败 {consecutive_fail}/{MAX_CONSECUTIVE_FAIL})", "warn")
 
-        if not fetched:
-            consecutive_fail += 1
-            _log(f"[{index+1}/{len(players)}] @{handle}: 所有实例均失败 (连续失败 {consecutive_fail}/{MAX_CONSECUTIVE_FAIL})", "warn")
+            delay = random.uniform(RSS_DELAY_MIN, RSS_DELAY_MAX)
+            await asyncio.sleep(delay)
 
-        delay = random.uniform(RSS_DELAY_MIN, RSS_DELAY_MAX)
-        await asyncio.sleep(delay)
+        _log(f"NitterRSS 抓取完成: {len(all_tweets)} 条推文, {translated_count} 条翻译", "success" if all_tweets else "warn")
 
-    _log(f"NitterRSS 完成: {len(all_tweets)} 条推文, {translated_count} 条翻译", "success" if all_tweets else "warn")
+        # 等待所有截图任务完成
+        if screenshot_tasks:
+            _log(f"等待 {len(screenshot_tasks)} 个截图任务完成...")
+            await asyncio.gather(*screenshot_tasks, return_exceptions=True)
 
-    # 全部抓取+翻译完成后，异步提交截图任务（不阻塞返回）
-    if all_tweets:
-        asyncio.ensure_future(_background_screenshot(all_tweets, covers_dir))
-        _log("截图任务已提交后台执行。")
+    finally:
+        _screenshot_status = "idle"
+        if browser:
+            await browser.close()
+        if pw_instance:
+            await pw_instance.stop()
 
+    _log(f"全部完成: {len(all_tweets)} 条推文+翻译+截图", "success" if all_tweets else "warn")
     return all_tweets
 
 
 async def _background_screenshot(tweets, covers_dir) -> None:
-    """后台为推文截图（不阻塞主流程）。"""
+    """后台为推文截图（不阻塞主流程）。逐条截图，每完成一条立刻同步保存。"""
+    global _screenshot_status
     import random
 
     EMBED_DELAY_MIN = 2.0
     EMBED_DELAY_MAX = 5.0
+
+    _screenshot_status = "running"
 
     pw_instance = None
     browser = None
@@ -1139,6 +1210,12 @@ async def _background_screenshot(tweets, covers_dir) -> None:
             if output_path.exists() and output_path.stat().st_size > 0:
                 tweet_data["cover_image_path"] = f"covers/{tid}.jpg"
                 screenshot_count += 1
+                with _tweets_lock:
+                    for t in _tweets:
+                        if t.get("tweet_id") == tid:
+                            t["cover_image_path"] = f"covers/{tid}.jpg"
+                            break
+                _save_tweets()
                 continue
 
             try:
@@ -1153,6 +1230,13 @@ async def _background_screenshot(tweets, covers_dir) -> None:
                 tweet_data["cover_image_path"] = f"covers/{tid}.jpg"
                 screenshot_count += 1
                 _log(f"截图 {screenshot_count}/{total}: {tid}")
+                # 每截一张就同步到全局并保存
+                with _tweets_lock:
+                    for t in _tweets:
+                        if t.get("tweet_id") == tid:
+                            t["cover_image_path"] = f"covers/{tid}.jpg"
+                            break
+                _save_tweets()
             except Exception as exc:
                 _log(f"截图失败 {tid}: {str(exc)[:60]}", "warn")
                 try:
@@ -1179,11 +1263,12 @@ async def _background_screenshot(tweets, covers_dir) -> None:
             if tid in tweets_by_id:
                 t["cover_image_path"] = tweets_by_id[tid]["cover_image_path"]
     _save_tweets()
+    _screenshot_status = "idle"
     _log(f"后台截图完成: {screenshot_count}/{total} 张", "success" if screenshot_count else "warn")
 
 
 async def _async_scrape_tweets() -> list[dict]:
-    """抓取最新推文。NitterRSS 方案逐条：抓取→翻译→截图→保存。"""
+    """抓取最新推文。NitterRSS 方案：逐条抓取→翻译→保存，截图与抓取并行。"""
     from config.players import load_players
 
     players = load_players()
@@ -1196,10 +1281,10 @@ async def _async_scrape_tweets() -> list[dict]:
         await _translate_tweets(filtered)
         return filtered
 
-    # 方案 B: Nitter RSS（逐条：抓取→翻译→截图→保存，实时更新）
+    # 方案 B: Nitter RSS（逐条抓取+翻译+并行截图）
     all_tweets = await _fetch_tweets_via_nitter_rss_v2(players)
     if all_tweets:
-        _set_tweet_source("rss", "实时推文来自 NitterRSS（逐条处理）。")
+        _set_tweet_source("rss", "实时推文来自 NitterRSS（抓取+截图并行）。")
         return all_tweets
 
     # 方案 C-E: 降级方案（批量翻译，无截图）

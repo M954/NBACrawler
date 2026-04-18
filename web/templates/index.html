@@ -224,7 +224,8 @@
         updateLogPanel(d.recent_logs, d.error_count);
         // 实时刷新推文列表
         await loadTweets();
-        if(d.status==='idle'){
+        if(d.status==='idle' && d.screenshot_status==='idle'){
+          // 抓取和截图都完成了，停止轮询
           document.getElementById('btn-scrape').disabled=false;
           document.getElementById('btn-scrape').textContent='🐦 抓取推文';
           document.getElementById('btn-stop-scrape').style.display='none';
@@ -234,10 +235,14 @@
           } else if(d.error_count>0){
             toast('抓取完成，但有 '+d.error_count+' 个错误，请查看日志','warning');
           } else if(d.tweet_count>0){
-            toast('抓取完成！'+d.tweet_count+' 条推文','success');
+            toast('全部完成！'+d.tweet_count+' 条推文（含截图）','success');
           } else {
             toast(d.source_message||'抓取完成但未获取到新推文，请检查实时源状态','warning');
           }
+        } else if(d.status==='idle' && d.screenshot_status==='running'){
+          // 抓取完成但截图还在进行，更新按钮文字但继续轮询
+          document.getElementById('btn-scrape').textContent='📸 截图中...';
+          document.getElementById('btn-stop-scrape').style.display='none';
         }
       }catch{}
     }
@@ -253,8 +258,13 @@
           document.getElementById('log-panel').style.display='block';
           updateLogPanel(d.recent_logs, d.error_count);
           if(!_tPoll)_tPoll=setInterval(pollTweet,3000);
+        } else if(d.screenshot_status==='running'){
+          document.getElementById('btn-scrape').disabled=true;
+          document.getElementById('btn-scrape').textContent='📸 截图中...';
+          document.getElementById('log-panel').style.display='block';
+          updateLogPanel(d.recent_logs, d.error_count);
+          if(!_tPoll)_tPoll=setInterval(pollTweet,3000);
         } else if(d.recent_logs && d.recent_logs.length>0){
-          // 显示上次的日志
           document.getElementById('log-panel').style.display='block';
           updateLogPanel(d.recent_logs, d.error_count);
         }
