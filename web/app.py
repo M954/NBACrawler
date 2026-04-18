@@ -860,6 +860,19 @@ def api_stop_tweets():
     return jsonify({"status": "stopped"})
 
 
+@app.route("/api/shutdown", methods=["POST"])
+def api_shutdown():
+    """关闭服务器。"""
+    import os, signal
+    _log("服务器正在关闭...", "warn")
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func:
+        func()
+    else:
+        os.kill(os.getpid(), signal.SIGTERM)
+    return jsonify({"message": "服务器正在关闭..."})
+
+
 def _run_tweet_scraper() -> None:
     """在后台线程中运行推文爬虫。"""
     global _tweet_status, _tweets

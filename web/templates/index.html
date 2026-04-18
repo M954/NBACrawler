@@ -98,6 +98,7 @@
         <button class="btn btn-primary" id="btn-scrape" onclick="startTweetScraper()">🐦 抓取推文</button>
         <button class="btn btn-stop" id="btn-stop-scrape" onclick="stopTweetScraper()" style="display:none">⏹ 停止抓取</button>
         <button class="btn btn-video" id="btn-video" onclick="startVideoGen()">🎬 生成视频</button>
+        <button class="btn" style="background:#ef4444;color:#fff" onclick="shutdownServer()">⏹ 关闭服务器</button>
         <select id="player-filter" onchange="onPlayerFilter()"><option value="">全部球星</option></select>
         <input type="text" id="tweet-search" placeholder="搜索推文..." oninput="filterTweets()">
       </div>
@@ -295,6 +296,15 @@
     async function loadArticles(){try{const r=await fetch('/api/articles');if(!r.ok)return;_articles=await r.json();const c=document.getElementById('article-list');c.className='article-grid';if(!_articles.length){c.innerHTML='<div class="empty-state"><div class="empty-icon">📭</div><p>暂无资讯</p></div>';return;}c.innerHTML=_articles.slice(0,20).map((a,i)=>`<article class="article-card" style="--i:${i}"><div class="card-top"><span class="source-badge">${esc(a.source)}</span></div><h2 class="title-cn">${esc(a.title_cn||a.title)}</h2><p class="title-en">${esc(a.title)}</p><p class="summary">${esc(a.summary_cn||a.summary||'')}</p><div class="card-footer"><span class="date">🕐 ${ago(a.publish_date)}</span><a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer" class="read-link">阅读原文 →</a></div></article>`).join('');document.getElementById('stat-total').textContent=_articles.length;document.getElementById('stat-translated').textContent=_articles.filter(a=>a.translation_status==='completed').length;document.getElementById('stat-sources').textContent=new Set(_articles.map(a=>a.source)).size;}catch{}}
 
     document.addEventListener('DOMContentLoaded',()=>{loadTweets();loadPlayers();checkTweetStatus();});
+
+    async function shutdownServer(){
+      if(!confirm('确定要关闭服务器吗？')) return;
+      try{
+        const r=await fetch('/api/shutdown',{method:'POST'});
+        const d=await r.json();
+        toast(d.message||'服务器正在关闭...','info');
+      }catch{toast('服务器已关闭','info');}
+    }
   </script>
 </body>
 </html>
