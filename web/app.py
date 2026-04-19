@@ -813,14 +813,21 @@ def api_tweet_status():
     """推文爬虫状态（含最新日志）。"""
     recent_logs = _service_logs[-500:] if _service_logs else []
     errors = [l for l in _service_logs[-50:] if l["level"] == "error"]
+    all_tweets = list(_tweets)
     return jsonify({
         "status": _tweet_status,
         "screenshot_status": _screenshot_status,
         "source_mode": _tweet_source_mode,
         "source_message": _tweet_source_message,
-        "tweet_count": len(_tweets),
+        "tweet_count": len(all_tweets),
         "recent_logs": recent_logs,
         "error_count": len(errors),
+        "stats": {
+            "total": len(all_tweets),
+            "players": len(set(t.get("player_handle", "") for t in all_tweets)),
+            "videos": len([t for t in all_tweets if t.get("video_url")]),
+            "translated": len([t for t in all_tweets if t.get("translation_status") == "completed"]),
+        },
     })
 
 
@@ -871,6 +878,21 @@ def api_shutdown():
     else:
         os.kill(os.getpid(), signal.SIGTERM)
     return jsonify({"message": "服务器正在关闭..."})
+
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    """重启服务器（通过退出进程让外部监控重新启动）。"""
+    import os, sys, signal, subprocess
+    _log("服务器正在重启...", "warn")
+    # 启动新进程
+    subprocess.Popen(
+        [sys.executable, "-m", "web.app", "--host", "0.0.0.0", "--port", "5000"],
+        cwd=str(Path(__file__).resolve().parent.parent),
+    )
+    # 关闭当前进程
+    os.kill(os.getpid(), signal.SIGTERM)
+    return jsonify({"message": "服务器正在重启..."})
 
 
 def _run_tweet_scraper() -> None:
@@ -1013,6 +1035,7 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                         t["cover_image_path"] = f"covers/{tid}.jpg"
                         break
             _save_tweets()
+            _log(f"截图缓存命中: {tid}")
             return
 
         try:

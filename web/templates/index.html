@@ -99,6 +99,7 @@
         <button class="btn btn-stop" id="btn-stop-scrape" onclick="stopTweetScraper()" style="display:none">⏹ 停止抓取</button>
         <button class="btn btn-video" id="btn-video" onclick="startVideoGen()">🎬 生成视频</button>
         <button class="btn" style="background:#ef4444;color:#fff" onclick="shutdownServer()">⏹ 关闭服务器</button>
+        <button class="btn" style="background:#f59e0b;color:#fff" onclick="restartServer()">🔄 重启服务器</button>
         <select id="player-filter" onchange="onPlayerFilter()"><option value="">全部球星</option></select>
         <input type="text" id="tweet-search" placeholder="搜索推文..." oninput="filterTweets()">
       </div>
@@ -179,7 +180,7 @@
       let f=_tweets;
       if(_selPlayer)f=f.filter(t=>(t.player_handle||'').toLowerCase()===_selPlayer.toLowerCase());
       if(q)f=f.filter(t=>(t.content_cn||'').toLowerCase().includes(q)||(t.content||'').toLowerCase().includes(q)||(t.player_name||'').toLowerCase().includes(q));
-      render(f);stats(f);
+      render(f);stats(_tweets);
     }
     function onPlayerFilter(){_selPlayer=document.getElementById('player-filter').value;_shown=20;filterTweets();}
 
@@ -212,7 +213,8 @@
       document.getElementById('btn-more').style.display=tweets.length>_shown?'':'none';
     }
     function loadMore(){_shown+=20;filterTweets();}
-    function stats(t){document.getElementById('ts-total').textContent=t.length;document.getElementById('ts-players').textContent=new Set(t.map(x=>x.player_handle)).size;document.getElementById('ts-videos').textContent=t.filter(x=>x.video_url).length;document.getElementById('ts-translated').textContent=t.filter(x=>x.translation_status==='completed').length;}
+    function stats(t){/* 本地统计仅作为后备 */document.getElementById('ts-total').textContent=t.length;document.getElementById('ts-players').textContent=new Set(t.map(x=>x.player_handle)).size;document.getElementById('ts-videos').textContent=t.filter(x=>x.video_url).length;document.getElementById('ts-translated').textContent=t.filter(x=>x.translation_status==='completed').length;}
+    function applyServerStats(s){if(!s)return;document.getElementById('ts-total').textContent=s.total;document.getElementById('ts-players').textContent=s.players;document.getElementById('ts-videos').textContent=s.videos;document.getElementById('ts-translated').textContent=s.translated;}
 
     /* 推文爬虫 */
     async function startTweetScraper(){try{const r=await fetch('/api/scrape-tweets',{method:'POST'});const d=await r.json();if(!r.ok){toast(d.error,'error');return;}document.getElementById('btn-scrape').disabled=true;document.getElementById('btn-scrape').textContent='⏳ 抓取中...';document.getElementById('btn-stop-scrape').style.display='';document.getElementById('log-panel').style.display='block';document.getElementById('log-content').innerHTML='<div style="color:var(--text-muted)">正在启动抓取...</div>';toast('推文爬虫已启动','success');if(!_tPoll)_tPoll=setInterval(pollTweet,3000);}catch(e){toast('失败','error');}}
@@ -221,6 +223,7 @@
       try{
         const r=await fetch('/api/tweet-status');
         const d=await r.json();
+        if(d.stats)applyServerStats(d.stats);
         // 更新日志面板
         updateLogPanel(d.recent_logs, d.error_count);
         // 实时刷新推文列表
@@ -252,6 +255,7 @@
       try{
         const r=await fetch('/api/tweet-status');
         const d=await r.json();
+        if(d.stats)applyServerStats(d.stats);
         if(d.status==='running'){
           document.getElementById('btn-scrape').disabled=true;
           document.getElementById('btn-scrape').textContent='⏳ 抓取中...';
@@ -304,6 +308,15 @@
         const d=await r.json();
         toast(d.message||'服务器正在关闭...','info');
       }catch{toast('服务器已关闭','info');}
+    }
+
+    async function restartServer(){
+      if(!confirm('确定要重启服务器吗？')) return;
+      try{
+        await fetch('/api/restart',{method:'POST'});
+      }catch{}
+      toast('服务器重启中，3秒后刷新页面...','info');
+      setTimeout(()=>{location.reload();},3000);
     }
   </script>
 </body>
