@@ -899,7 +899,15 @@ def _run_tweet_scraper() -> None:
                     old_by_id[tid] = t
                 _tweets.clear()
                 merged = sorted(old_by_id.values(), key=lambda t: t.get("tweet_date", ""), reverse=True)
-                _tweets.extend(merged)
+                # 每个球星只保留最新一条
+                seen_handles = set()
+                kept = []
+                for t in merged:
+                    h = t.get("player_handle", "")
+                    if h not in seen_handles:
+                        seen_handles.add(h)
+                        kept.append(t)
+                _tweets.extend(kept)
             _save_tweets()
             if _tweet_source_mode == "cache":
                 _log(f"实时源不可用，继续显示缓存数据 {len(tweets)} 条。", "warn")
@@ -1030,6 +1038,64 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
             except Exception:
                 pass
 
+    async def _download_video_one(tid, handle, videos_dir):
+        """通过 fxtwitter API 获取视频 URL 并下载。"""
+        video_filename = f"tweet_{tid}.mp4"
+        video_path = videos_dir / video_filename
+        if video_path.exists() and video_path.stat().st_size > 0:
+            with _tweets_lock:
+                for t in _tweets:
+                    if t.get("tweet_id") == tid:
+                        t["video_url"] = f"/video/{video_filename}"
+                        break
+            _save_tweets()
+            _log(f"视频缓存命中: {tid}")
+            return
+
+        try:
+            fx_url = f"https://api.fxtwitter.com/{handle}/status/{tid}"
+            fx_req = urllib.request.Request(fx_url, headers={
+                "User-Agent": random.choice(UA_LIST),
+                "Accept": "application/json",
+            })
+            fx_resp = urllib.request.urlopen(fx_req, timeout=15)
+            fx_data = json.loads(fx_resp.read().decode("utf-8", errors="replace"))
+            tweet_obj = fx_data.get("tweet", {})
+            media_all = tweet_obj.get("media", {}).get("all", [])
+
+            video_url = None
+            for m in media_all:
+                if m.get("type") == "video" and m.get("url"):
+                    video_url = m["url"]
+                    break
+
+            if not video_url:
+                return
+
+            # 下载视频
+            vid_req = urllib.request.Request(video_url, headers={
+                "User-Agent": random.choice(UA_LIST),
+            })
+            vid_resp = urllib.request.urlopen(vid_req, timeout=60)
+            with open(str(video_path), "wb") as f:
+                while True:
+                    chunk = vid_resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+
+            with _tweets_lock:
+                for t in _tweets:
+                    if t.get("tweet_id") == tid:
+                        t["video_url"] = f"/video/{video_filename}"
+                        break
+            _save_tweets()
+            size_mb = video_path.stat().st_size / 1024 / 1024
+            _log(f"视频下载完成: {tid} ({size_mb:.1f}MB)")
+
+        except Exception as exc:
+            _log(f"视频下载失败 {tid}: {str(exc)[:60]}", "warn")
+
     try:
         for index, player in enumerate(players):
             handle = player.handle
@@ -1056,6 +1122,8 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                     items = root.findall(".//item")
 
                     player_count = 0
+                    fallback_rt_item = None  # 备用：第一条 RT
+
                     for item in items:
                         if player_count >= MAX_PER_PLAYER:
                             break
@@ -1072,11 +1140,19 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                         title_text = title_el.text.strip() if title_el is not None and title_el.text else ""
 
                         if title_text.startswith("RT by"):
+                            # 记住第一条 RT 作为备用
+                            if fallback_rt_item is None:
+                                fallback_rt_item = item
                             continue
 
                         content = title_text
                         if not content or len(content) < 5:
                             continue
+
+                        # 检测是否有视频
+                        desc_el = item.find("description")
+                        desc_text = desc_el.text if desc_el is not None and desc_el.text else ""
+                        has_video = ">Video<" in desc_text
 
                         pubdate_el = item.find("pubDate")
                         tweet_date = datetime.now(timezone.utc).isoformat()
@@ -1110,6 +1186,7 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                             "url": f"https://x.com/{handle}/status/{tid}",
                             "media_urls": [],
                             "cover_image_path": None,
+                            "video_url": None,
                             "retweet_count": 0,
                             "like_count": 0,
                             "reply_count": 0,
@@ -1121,7 +1198,7 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                         all_tweets.append(tweet_data)
                         player_count += 1
 
-                        _log(f"[{index+1}/{len(players)}] @{handle}: 抓取+翻译({translation_status}) 完成")
+                        _log(f"[{index+1}/{len(players)}] @{handle}: 抓取+翻译({translation_status}){' [有视频]' if has_video else ''} 完成")
 
                         # 3. 实时保存
                         with _tweets_lock:
@@ -1135,6 +1212,94 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                         # 4. 异步提交截图（不等待，与下一条抓取并行）
                         if browser:
                             task = asyncio.ensure_future(_screenshot_one(tid, covers_dir, browser))
+                            screenshot_tasks.append(task)
+
+                        # 5. 有视频则异步下载
+                        if has_video:
+                            videos_dir = settings.output_dir / "videos"
+                            videos_dir.mkdir(parents=True, exist_ok=True)
+                            task = asyncio.ensure_future(_download_video_one(tid, handle, videos_dir))
+                            screenshot_tasks.append(task)
+
+                    if player_count == 0 and fallback_rt_item is not None:
+                        # 没有原创推文，用第一条 RT
+                        rt_item = fallback_rt_item
+                        rt_link = rt_item.find("link")
+                        rt_link_text = rt_link.text.strip() if rt_link is not None and rt_link.text else ""
+                        rt_tid = rt_link_text.split("/status/")[-1].split("#")[0].split("?")[0]
+
+                        rt_title_el = rt_item.find("title")
+                        rt_title_text = rt_title_el.text.strip() if rt_title_el is not None and rt_title_el.text else ""
+                        # "RT by @handle: original content" -> 取 original content
+                        rt_content = rt_title_text
+                        if ": " in rt_content:
+                            rt_content = rt_content.split(": ", 1)[1]
+
+                        rt_desc_el = rt_item.find("description")
+                        rt_desc_text = rt_desc_el.text if rt_desc_el is not None and rt_desc_el.text else ""
+                        rt_has_video = ">Video<" in rt_desc_text
+
+                        rt_pubdate_el = rt_item.find("pubDate")
+                        rt_tweet_date = datetime.now(timezone.utc).isoformat()
+                        if rt_pubdate_el is not None and rt_pubdate_el.text:
+                            try:
+                                rt_tweet_date = parsedate_to_datetime(rt_pubdate_el.text.strip()).isoformat()
+                            except Exception:
+                                pass
+
+                        # 翻译 RT 内容
+                        rt_content_cn = None
+                        rt_translation_status = "pending"
+                        if translator_backend and expand_twitter_slang and rt_content and len(rt_content) >= 5:
+                            try:
+                                rt_text_expanded = expand_twitter_slang(rt_content)
+                                rt_content_cn = await translator_backend.translate(rt_text_expanded)
+                                for wrong, right in POST_TRANSLATION_FIXES.items():
+                                    rt_content_cn = rt_content_cn.replace(wrong, right)
+                                rt_translation_status = "completed"
+                                translated_count += 1
+                            except Exception:
+                                rt_translation_status = "failed"
+
+                        rt_tweet_data = {
+                            "tweet_id": str(rt_tid),
+                            "player_name": player.name,
+                            "player_handle": handle,
+                            "content": rt_content[:500] if rt_content else "",
+                            "content_cn": rt_content_cn,
+                            "url": f"https://x.com/{handle}/status/{rt_tid}",
+                            "media_urls": [],
+                            "cover_image_path": None,
+                            "video_url": None,
+                            "retweet_count": 0,
+                            "like_count": 0,
+                            "reply_count": 0,
+                            "tweet_type": "retweet",
+                            "tweet_date": rt_tweet_date,
+                            "scraped_at": datetime.now(timezone.utc).isoformat(),
+                            "translation_status": rt_translation_status,
+                        }
+                        all_tweets.append(rt_tweet_data)
+                        player_count += 1
+
+                        _log(f"[{index+1}/{len(players)}] @{handle}: 无原创推文，使用 RT ({rt_translation_status}){' [有视频]' if rt_has_video else ''}")
+
+                        with _tweets_lock:
+                            old_by_id = {t["tweet_id"]: t for t in _tweets}
+                            old_by_id[rt_tweet_data["tweet_id"]] = rt_tweet_data
+                            _tweets.clear()
+                            merged = sorted(old_by_id.values(), key=lambda t: t.get("tweet_date", ""), reverse=True)
+                            _tweets.extend(merged)
+                        _save_tweets()
+
+                        if browser:
+                            task = asyncio.ensure_future(_screenshot_one(rt_tid, covers_dir, browser))
+                            screenshot_tasks.append(task)
+
+                        if rt_has_video:
+                            videos_dir = settings.output_dir / "videos"
+                            videos_dir.mkdir(parents=True, exist_ok=True)
+                            task = asyncio.ensure_future(_download_video_one(rt_tid, handle, videos_dir))
                             screenshot_tasks.append(task)
 
                     if player_count > 0:

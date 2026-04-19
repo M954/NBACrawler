@@ -191,7 +191,7 @@
         let media='';
         if(hasV){
           const poster=t.cover_image_path?'/covers/'+esc(t.cover_image_path.replace('covers/','')):'';
-          media=`<div class="tweet-video"><video controls preload="metadata" poster="${poster}"><source src="${esc(t.video_url)}" type="video/mp4"></video><span class="video-badge">🎬 ${t.video_duration||''}s</span></div>`;
+          media=`<div class="tweet-video"><video controls preload="auto" poster="${poster}" style="max-width:100%;border-radius:8px"><source src="${esc(t.video_url)}" type="video/mp4"></video></div>`;
         }else if(t.cover_image_path){
           const u='/covers/'+esc(t.cover_image_path.replace('covers/',''));
           media=`<div class="tweet-screenshot" onclick="openLightbox('${u}')"><img src="${u}" alt="Tweet" loading="lazy"></div>`;
