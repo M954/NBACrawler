@@ -789,7 +789,7 @@ def api_tweets():
     from datetime import datetime, timezone, timedelta
     player = request.args.get("player", "")
     tweet_type = request.args.get("type", "")
-    days = request.args.get("days", "30")  # 默认只返回最近30天
+    days = request.args.get("days", "0")  # 默认返回全部
     filtered = list(_tweets)
     if player:
         filtered = [t for t in filtered if t.get("player_handle", "").lower() == player.lower()]
@@ -943,6 +943,7 @@ def _run_tweet_scraper() -> None:
         _log(f"推文爬虫错误: {e}", "error")
         traceback.print_exc()
     finally:
+        _tweet_stop_event.clear()
         _tweet_status = "idle"
 
 
@@ -1121,6 +1122,10 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
 
     try:
         for index, player in enumerate(players):
+            if _tweet_stop_event.is_set():
+                _log("用户已停止抓取。", "warn")
+                break
+
             handle = player.handle
 
             if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
@@ -1564,13 +1569,20 @@ def serve_video(filename):
 
 @app.route("/api/generate-videos", methods=["POST"])
 def api_generate_videos():
-    """启动视频生成流程（后台线程）。"""
+    """启动视频生成流程（后台线程）。支持 JSON body: {tweet_ids: [...]} 选择性生成。"""
     global _video_gen_thread, _video_gen_status
     if _video_gen_status == "running":
         return jsonify({"error": "视频生成正在运行中"}), 409
-    _video_gen_thread = threading.Thread(target=_run_video_generation, daemon=True)
+    data = request.get_json(silent=True) or {}
+    tweet_ids = data.get("tweet_ids", [])
+    _video_gen_thread = threading.Thread(target=_run_video_generation, args=(tweet_ids,), daemon=True)
     _video_gen_thread.start()
-    return jsonify({"status": "running"})
+    with _tweets_lock:
+        if tweet_ids:
+            count = len(tweet_ids)
+        else:
+            count = sum(1 for t in _tweets if not t.get("video_url"))
+    return jsonify({"status": "running", "count": count})
 
 
 @app.route("/api/video-status")
@@ -1589,8 +1601,8 @@ _video_gen_status: str = "idle"
 _video_gen_thread: threading.Thread | None = None
 
 
-def _run_video_generation():
-    """后台执行视频生成（使用 urllib）。"""
+def _run_video_generation(tweet_ids=None):
+    """后台执行视频生成（使用 urllib）。tweet_ids 为空则生成所有无视频的推文。"""
     global _video_gen_status, _tweets
     _video_gen_status = "running"
     start_time = time.time()
@@ -1601,7 +1613,11 @@ def _run_video_generation():
         import urllib.error
 
         with _tweets_lock:
-            pending = [t for t in _tweets if not t.get("video_url")]
+            if tweet_ids:
+                tid_set = set(tweet_ids)
+                pending = [t for t in _tweets if t.get("tweet_id") in tid_set]
+            else:
+                pending = [t for t in _tweets if not t.get("video_url")]
         print(f"Video generation: {len(pending)} tweets pending")
 
         for i, tweet in enumerate(pending):

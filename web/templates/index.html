@@ -11,7 +11,7 @@
     .tab-btn { padding:0.75rem 1.5rem; background:none; border:none; border-bottom:3px solid transparent; font-size:1rem; font-weight:600; color:var(--text-muted); cursor:pointer; transition:var(--transition); }
     .tab-btn:hover { color:var(--text); }
     .tab-btn.active { color:var(--primary); border-bottom-color:var(--primary); }
-    .tweet-feed { max-width:680px; margin:0 auto; display:flex; flex-direction:column; gap:1.2rem; }
+    .tweet-feed { max-width:960px; margin:0 auto; display:flex; flex-direction:column; gap:1.2rem; }
     .tweet-item { background:var(--bg-card); border-radius:var(--radius); box-shadow:var(--shadow-sm); overflow:hidden; transition:var(--transition); border:1px solid var(--border); }
     .tweet-item:hover { box-shadow:var(--shadow-md); transform:translateY(-2px); }
     .tweet-header { display:flex; align-items:center; gap:0.75rem; padding:1rem 1.2rem 0.5rem; }
@@ -32,7 +32,7 @@
     .tweet-footer { display:flex; justify-content:space-between; align-items:center; padding:0.5rem 1.2rem 1rem; border-top:1px solid var(--border); }
     .tweet-footer a { color:var(--primary); font-size:0.85rem; text-decoration:none; font-weight:600; }
     .tweet-footer a:hover { text-decoration:underline; }
-    .action-bar { max-width:680px; margin:0 auto 1.2rem; display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; }
+    .action-bar { max-width:960px; margin:0 auto 1.2rem; display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap; }
     .action-bar .btn { padding:0.6rem 1.2rem; border-radius:8px; border:none; cursor:pointer; font-size:0.9rem; font-weight:600; transition:var(--transition); }
     .btn-primary { background:var(--primary); color:#fff; }
     .btn-primary:hover { opacity:0.85; }
@@ -43,7 +43,7 @@
     .btn-video:disabled { opacity:0.5; cursor:not-allowed; }
     .action-bar select, .action-bar input { padding:0.5rem 0.8rem; border-radius:8px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:0.9rem; }
     .action-bar input { flex:1; min-width:150px; }
-    .mini-stats { max-width:680px; margin:0 auto 1rem; display:flex; gap:1rem; flex-wrap:wrap; }
+    .mini-stats { max-width:960px; margin:0 auto 1rem; display:flex; gap:1rem; flex-wrap:wrap; }
     .mini-stat { display:flex; align-items:center; gap:0.4rem; font-size:0.85rem; color:var(--text-muted); }
     .mini-stat strong { color:var(--text); font-size:1.1rem; }
     .gen-progress { max-width:680px; margin:0 auto; padding:0.5rem 0; display:none; }
@@ -98,6 +98,7 @@
         <button class="btn btn-primary" id="btn-scrape" onclick="startTweetScraper()">🐦 抓取推文</button>
         <button class="btn btn-stop" id="btn-stop-scrape" onclick="stopTweetScraper()" style="display:none">⏹ 停止抓取</button>
         <button class="btn btn-video" id="btn-video" onclick="startVideoGen()">🎬 生成视频</button>
+        <button class="btn" style="background:#6366f1;color:#fff;display:none" id="btn-select-all" onclick="toggleSelectAll()">☑ 全选待生成</button>
         <button class="btn" style="background:#ef4444;color:#fff" onclick="shutdownServer()">⏹ 关闭服务器</button>
         <button class="btn" style="background:#f59e0b;color:#fff" onclick="restartServer()">🔄 重启服务器</button>
         <select id="player-filter" onchange="onPlayerFilter()"><option value="">全部球星</option></select>
@@ -121,7 +122,7 @@
 
       <div class="tweet-feed" id="tweet-feed"></div>
       <div style="text-align:center;padding:2rem 0">
-        <button class="btn btn-secondary" id="btn-more" onclick="loadMore()" style="display:none">加载更多</button>
+        <div class="pagination" id="tweet-pagination" style="display:flex;justify-content:center;gap:6px;margin-top:1rem;flex-wrap:wrap"></div>
       </div>
     </div>
 
@@ -156,7 +157,7 @@
 
   <script>
     window.__INITIAL_SOURCES__ = {{ available_sources | tojson }};
-    let _tweets=[], _articles=[], _players=[], _selPlayer='', _shown=20;
+    let _tweets=[], _articles=[], _players=[], _selPlayer='', _page=1, _perPage=10;
     let _tPoll=null, _vPoll=null;
 
     function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
@@ -173,7 +174,7 @@
 
     async function loadPlayers(){try{const r=await fetch('/api/players');if(!r.ok)return;_players=await r.json();const s=document.getElementById('player-filter'),c=_selPlayer;s.innerHTML='<option value="">全部球星</option>'+_players.map(p=>`<option value="${esc(p.handle)}">${esc(p.name)}</option>`).join('');if(c)s.value=c;}catch{}}
 
-    async function loadTweets(){try{const r=await fetch('/api/tweets');if(!r.ok)return;_tweets=await r.json();_shown=20;filterTweets();}catch{toast('加载失败','error');}}
+    async function loadTweets(){try{const r=await fetch('/api/tweets');if(!r.ok)return;_tweets=await r.json();_page=1;filterTweets();}catch{toast('加载失败','error');}}
 
     function filterTweets(){
       const q=(document.getElementById('tweet-search').value||'').toLowerCase().trim();
@@ -182,11 +183,14 @@
       if(q)f=f.filter(t=>(t.content_cn||'').toLowerCase().includes(q)||(t.content||'').toLowerCase().includes(q)||(t.player_name||'').toLowerCase().includes(q));
       render(f);stats(_tweets);
     }
-    function onPlayerFilter(){_selPlayer=document.getElementById('player-filter').value;_shown=20;filterTweets();}
+    function onPlayerFilter(){_selPlayer=document.getElementById('player-filter').value;_page=1;filterTweets();}
 
     function render(tweets){
-      const c=document.getElementById('tweet-feed'),vis=tweets.slice(0,_shown);
-      if(!vis.length){c.innerHTML='<div style="text-align:center;padding:3rem;color:var(--text-muted)"><div style="font-size:3rem">🐦</div><p>暂无推文</p><p>点击"抓取推文"获取最新球星动态</p></div>';document.getElementById('btn-more').style.display='none';return;}
+      const c=document.getElementById('tweet-feed');
+      const totalPages=Math.ceil(tweets.length/_perPage)||1;
+      if(_page>totalPages)_page=totalPages;
+      const start=(_page-1)*_perPage, vis=tweets.slice(start,start+_perPage);
+      if(!vis.length){c.innerHTML='<div style="text-align:center;padding:3rem;color:var(--text-muted)"><div style="font-size:3rem">🐦</div><p>暂无推文</p><p>点击"抓取推文"获取最新球星动态</p></div>';document.getElementById('tweet-pagination').innerHTML='';return;}
       c.innerHTML=vis.map((t,i)=>{
         const init=(t.player_name||'?')[0], hasV=!!t.video_url;
         let media='';
@@ -200,19 +204,29 @@
         const tr=t.translation_status==='completed';
         return `<div class="tweet-item" style="animation-delay:${i*0.04}s">
           <div class="tweet-header">
+            <label class="tweet-select" style="margin-right:8px;cursor:pointer" title="选择生成视频"><input type="checkbox" class="tweet-checkbox" data-tid="${esc(t.tweet_id)}" onchange="updateVideoSelection()"></label>
             <div class="tweet-avatar">${esc(init)}</div>
             <div class="tweet-author"><div class="tweet-author-name">${esc(t.player_name)}${tr?' <span class="translated-badge" style="font-size:0.7rem;vertical-align:middle">已翻译</span>':''}</div><div class="tweet-author-handle">@${esc(t.player_handle)}</div></div>
             <div class="tweet-time">${ago(t.tweet_date)}</div>
           </div>
           <div class="tweet-body"><div class="tweet-text-cn">${esc(t.content_cn||t.content)}</div>${t.content_cn?`<div class="tweet-text-en">${esc(t.content)}</div>`:''}</div>
           ${media}
-          ${!hasV&&t.cover_image_path?'<span class="no-video-badge">⏳ 待生成视频</span>':''}
           <div class="tweet-footer"><span style="color:var(--text-muted);font-size:0.8rem">${hasV?'🎬 视频':'📸 截图'}</span><a href="${esc(t.url)}" target="_blank" rel="noopener noreferrer">查看原文 →</a></div>
         </div>`;
       }).join('');
-      document.getElementById('btn-more').style.display=tweets.length>_shown?'':'none';
+      // 分页
+      let pg='';
+      if(totalPages>1){
+        pg+=`<button class="btn btn-secondary" style="min-width:36px;padding:4px 10px" ${_page<=1?'disabled':''} onclick="goPage(${_page-1})">‹</button>`;
+        for(let p=1;p<=totalPages;p++){
+          pg+=`<button class="btn ${p===_page?'btn-primary':'btn-secondary'}" style="min-width:36px;padding:4px 10px" onclick="goPage(${p})">${p}</button>`;
+        }
+        pg+=`<button class="btn btn-secondary" style="min-width:36px;padding:4px 10px" ${_page>=totalPages?'disabled':''} onclick="goPage(${_page+1})">›</button>`;
+      }
+      document.getElementById('tweet-pagination').innerHTML=pg;
+      updateVideoSelection();
     }
-    function loadMore(){_shown+=20;filterTweets();}
+    function goPage(p){_page=p;filterTweets();window.scrollTo({top:document.getElementById('tweet-feed').offsetTop-80,behavior:'smooth'});}
     function stats(t){/* 本地统计仅作为后备 */document.getElementById('ts-total').textContent=t.length;document.getElementById('ts-players').textContent=new Set(t.map(x=>x.player_handle)).size;document.getElementById('ts-videos').textContent=t.filter(x=>x.video_url).length;document.getElementById('ts-translated').textContent=t.filter(x=>x.translation_status==='completed').length;}
     function applyServerStats(s){if(!s)return;document.getElementById('ts-total').textContent=s.total;document.getElementById('ts-players').textContent=s.players;document.getElementById('ts-videos').textContent=s.videos;document.getElementById('ts-translated').textContent=s.translated;}
 
@@ -292,8 +306,30 @@
       content.scrollTop=content.scrollHeight;
     }
 
-    /* 视频生成 */
-    async function startVideoGen(){try{const r=await fetch('/api/generate-videos',{method:'POST'});const d=await r.json();if(!r.ok){toast(d.error,'error');return;}document.getElementById('btn-video').disabled=true;document.getElementById('btn-video').textContent='⏳ 生成中...';document.getElementById('video-progress').classList.add('active');toast('视频生成已启动','success');if(!_vPoll)_vPoll=setInterval(pollVideo,3000);}catch(e){toast('失败','error');}}
+    /* 视频生成 - 选择模式 */
+    function updateVideoSelection(){
+      const checked=document.querySelectorAll('.tweet-checkbox:checked');
+      const btn=document.getElementById('btn-video');
+      if(checked.length>0){btn.textContent=`🎬 生成视频 (${checked.length})`;btn.disabled=false;} else {btn.textContent='🎬 生成视频';btn.disabled=true;}
+      document.getElementById('btn-select-all').style.display=_tweets.length>0?'':'none';
+    }
+    function toggleSelectAll(){
+      const boxes=document.querySelectorAll('.tweet-checkbox');
+      const allChecked=[...boxes].every(b=>b.checked);
+      boxes.forEach(b=>{b.checked=!allChecked;});
+      updateVideoSelection();
+    }
+    async function startVideoGen(){
+      const checked=[...document.querySelectorAll('.tweet-checkbox:checked')].map(cb=>cb.dataset.tid);
+      const body=checked.length>0?{tweet_ids:checked}:{};
+      try{
+        const r=await fetch('/api/generate-videos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        const d=await r.json();if(!r.ok){toast(d.error,'error');return;}
+        document.getElementById('btn-video').disabled=true;document.getElementById('btn-video').textContent='⏳ 生成中...';
+        document.getElementById('video-progress').classList.add('active');
+        toast(`视频生成已启动 (${d.count} 条)`,'success');
+        if(!_vPoll)_vPoll=setInterval(pollVideo,3000);
+      }catch(e){toast('失败','error');}}
     async function pollVideo(){try{const r=await fetch('/api/video-status');const d=await r.json();const p=d.total>0?Math.round(d.with_video/d.total*100):0;document.getElementById('vp-fill').style.width=p+'%';document.getElementById('vp-text').textContent=`视频: ${d.with_video}/${d.total} (${p}%)`;if(d.status==='idle'){document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';document.getElementById('video-progress').classList.remove('active');if(_vPoll){clearInterval(_vPoll);_vPoll=null;}await loadTweets();toast(`视频完成 ${d.with_video}/${d.total}`,'success');}}catch{}}
 
     /* 资讯 */
