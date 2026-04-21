@@ -996,14 +996,24 @@ def api_video_server_restart():
 
 @app.route("/api/video-server/logs")
 def api_video_server_logs():
-    """代理获取 Video 服务器日志。"""
+    """获取 Video 服务器日志（优先读本地日志文件，fallback 到 API）。"""
+    log_file = Path(__file__).resolve().parent.parent.parent / "NBAVedio" / "output" / "logs" / "video.log"
+    if log_file.exists():
+        try:
+            content = log_file.read_text(encoding="utf-8").strip()
+            if content:
+                return jsonify(content)
+            return jsonify("")
+        except Exception:
+            pass
+    # fallback: 从 video server API 获取
     import urllib.request, urllib.error
     try:
         resp = urllib.request.urlopen(f"{VIDEO_SERVER}/logs", timeout=5)
         data = json.loads(resp.read().decode("utf-8"))
         return jsonify(data)
     except Exception:
-        return jsonify([])
+        return jsonify("")
 
 
 @app.route("/api/generated-videos", methods=["GET", "DELETE"])
@@ -1748,19 +1758,22 @@ def api_video_status():
         "total": len(_tweets),
         "with_video": with_video,
         "pending": len(_tweets) - with_video,
+        "gen_current": _video_gen_progress["current"],
+        "gen_total": _video_gen_progress["total"],
     })
 
 
 _video_gen_status: str = "idle"
 _video_gen_thread: threading.Thread | None = None
+_video_gen_progress: dict = {"current": 0, "total": 0}
 
 
 def _run_video_generation(tweet_ids=None, backend=None):
     """后台执行视频生成（使用 urllib）。tweet_ids 为空则生成所有无视频的推文。backend: claude/gpt。"""
-    global _video_gen_status, _tweets
+    global _video_gen_status, _tweets, _video_gen_progress
     _video_gen_status = "running"
     start_time = time.time()
-    MAX_TIMEOUT = 600
+    MAX_TIMEOUT = 1800  # 30分钟，每条视频可能需要几分钟
 
     try:
         import urllib.request
@@ -1772,9 +1785,11 @@ def _run_video_generation(tweet_ids=None, backend=None):
                 pending = [t for t in _tweets if t.get("tweet_id") in tid_set]
             else:
                 pending = [t for t in _tweets if not t.get("video_url")]
+        _video_gen_progress = {"current": 0, "total": len(pending)}
         print(f"Video generation: {len(pending)} tweets pending")
 
         for i, tweet in enumerate(pending):
+            _video_gen_progress["current"] = i
             if time.time() - start_time > MAX_TIMEOUT:
                 print(f"  Video generation timeout")
                 break
@@ -1804,19 +1819,17 @@ def _run_video_generation(tweet_ids=None, backend=None):
                 body += val.encode("utf-8")
                 body += b"\r\n"
 
-            # 如果推文有本地视频，附加上传
-            tweet_video_url = tweet.get("video_url", "")
-            if tweet_video_url:
-                # video_url 格式: /video/tweet_xxx.mp4
-                video_filename = tweet_video_url.split("/")[-1]
-                video_file = Path(__file__).resolve().parent.parent / "output" / "videos" / video_filename
-                if video_file.exists():
+            # 如果推文有本地下载的原始视频，附加上传
+            tweet_id = tweet.get("tweet_id", "")
+            if tweet_id:
+                source_video = Path(__file__).resolve().parent.parent / "output" / "videos" / f"tweet_{tweet_id}.mp4"
+                if source_video.exists():
                     body += f"--{boundary}\r\n".encode()
-                    body += f'Content-Disposition: form-data; name="video"; filename="{video_file.name}"\r\n'.encode()
+                    body += f'Content-Disposition: form-data; name="video"; filename="{source_video.name}"\r\n'.encode()
                     body += b"Content-Type: video/mp4\r\n\r\n"
-                    body += video_file.read_bytes()
+                    body += source_video.read_bytes()
                     body += b"\r\n"
-                    print(f"  Video [{i+1}/{len(pending)}] 附带推文视频: {video_file.name}")
+                    print(f"  Video [{i+1}/{len(pending)}] 附带推文视频: {source_video.name}")
 
             body += f"--{boundary}--\r\n".encode()
 
@@ -1827,7 +1840,7 @@ def _run_video_generation(tweet_ids=None, backend=None):
                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
                     method="POST",
                 )
-                resp = urllib.request.urlopen(req, timeout=180)
+                resp = urllib.request.urlopen(req, timeout=600)
                 result = json.loads(resp.read().decode("utf-8"))
 
                 with _tweets_lock:
@@ -1838,10 +1851,13 @@ def _run_video_generation(tweet_ids=None, backend=None):
                 _save_tweets()
                 score = result.get("ai_enhanced", {}).get("review", {}).get("score", "")
                 print(f"  Video [{i+1}/{len(pending)}] @{tweet.get('player_handle')}: OK (score: {score})")
+                _video_gen_progress["current"] = i + 1
             except urllib.error.HTTPError as e:
                 print(f"  Video [{i+1}/{len(pending)}] FAIL: HTTP {e.code}")
+                _video_gen_progress["current"] = i + 1
             except Exception as e:
                 print(f"  Video [{i+1}/{len(pending)}] ERR: {e}")
+                _video_gen_progress["current"] = i + 1
 
             time.sleep(2)
 

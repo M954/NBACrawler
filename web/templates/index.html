@@ -118,7 +118,7 @@
       </div>
 
       <!-- 服务日志面板 -->
-      <div id="log-panel" style="max-width:960px;margin:0 auto 1rem;display:none">
+      <div id="log-panel" style="max-width:960px;margin:0 auto 1rem">
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
           <div style="display:flex;justify-content:space-between;align-items:center;padding:0.6rem 1rem;background:var(--border);cursor:pointer" onclick="document.getElementById('log-content').style.display=document.getElementById('log-content').style.display==='none'?'':'none'">
             <span style="font-weight:600;font-size:0.9rem">📋 服务日志</span>
@@ -128,7 +128,7 @@
         </div>
       </div>
 
-      <div id="vlog-panel" style="max-width:960px;margin:0 auto 1rem;display:none">
+      <div id="vlog-panel" style="max-width:960px;margin:0 auto 1rem">
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
           <div style="display:flex;justify-content:space-between;align-items:center;padding:0.6rem 1rem;background:var(--border);cursor:pointer" onclick="document.getElementById('vlog-content').style.display=document.getElementById('vlog-content').style.display==='none'?'':'none'">
             <span style="font-weight:600;font-size:0.9rem">🎬 Video服务器日志</span>
@@ -188,7 +188,7 @@
 
   <script>
     window.__INITIAL_SOURCES__ = {{ available_sources | tojson }};
-    let _tweets=[], _articles=[], _players=[], _selPlayer='', _page=1, _perPage=10;
+    let _tweets=[], _articles=[], _players=[], _selPlayer='', _page=1, _perPage=10, _videoGenCount=0, _videoGenBefore=0;
     let _tPoll=null, _vPoll=null;
 
     function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
@@ -360,13 +360,15 @@
         document.getElementById('btn-video').disabled=true;document.getElementById('btn-video').textContent='⏳ 生成中...';
         document.getElementById('video-progress').classList.add('active');
         toast(`视频生成已启动 (${d.count} 条)`,'success');
+        _videoGenCount=d.count;
+        _videoGenBefore=_tweets.filter(t=>t.video_url).length;
         if(!_vPoll)_vPoll=setInterval(pollVideo,3000);
         document.getElementById('vlog-panel').style.display='block';
         document.getElementById('vlog-content').innerHTML='<div style="color:#9ca3af">正在连接 Video 服务器...</div>';
         pollVideoLogs();
         if(!_vlogPoll)_vlogPoll=setInterval(pollVideoLogs,3000);
       }catch(e){toast('失败','error');}}
-    async function pollVideo(){try{const r=await fetch('/api/video-status');const d=await r.json();const p=d.total>0?Math.round(d.with_video/d.total*100):0;document.getElementById('vp-fill').style.width=p+'%';document.getElementById('vp-text').textContent=`视频: ${d.with_video}/${d.total} (${p}%)`;await pollVideoLogs();if(d.status==='idle'){document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';document.getElementById('video-progress').classList.remove('active');if(_vPoll){clearInterval(_vPoll);_vPoll=null;}if(_vlogPoll){clearInterval(_vlogPoll);_vlogPoll=null;}await loadTweets();toast(`视频完成 ${d.with_video}/${d.total}`,'success');}}catch{}}
+    async function pollVideo(){try{const r=await fetch('/api/video-status');const d=await r.json();const done=d.gen_current||0;const total=d.gen_total||1;const p=total>0?Math.min(Math.round(done/total*100),100):0;document.getElementById('vp-fill').style.width=p+'%';document.getElementById('vp-text').textContent=`视频生成: ${done}/${total} (${p}%)`;await pollVideoLogs();if(d.status==='idle'){document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';document.getElementById('video-progress').classList.remove('active');if(_vPoll){clearInterval(_vPoll);_vPoll=null;}if(_vlogPoll){clearInterval(_vlogPoll);_vlogPoll=null;}if(_videoGenCount>0){_videoGenCount=0;_videoGenBefore=0;await loadTweets();toast('视频生成完成','success');}}}catch{}}
 
     /* 生成视频列表 */
     async function deleteVideo(filename){
@@ -440,35 +442,53 @@
       }
     }
     async function startVideoServer(){
-      try{const r=await fetch('/api/video-server/start',{method:'POST'});const d=await r.json();toast(d.message||d.error,'info');setTimeout(checkVideoServer,3000);}catch{toast('启动失败','error');}
+      try{const r=await fetch('/api/video-server/start',{method:'POST'});const d=await r.json();toast(d.message||d.error,'info');
+        const el=document.getElementById('video-server-status');el.textContent='Video服务器: 启动中...';el.style.background='#854d0e';el.style.color='#fef08a';
+        setTimeout(checkVideoServer,2000);setTimeout(checkVideoServer,5000);
+      }catch{toast('启动失败','error');}
     }
     async function shutdownVideoServer(){
       if(!confirm('确定要关闭 Video 服务器吗？')) return;
-      try{const r=await fetch('/api/video-server/shutdown',{method:'POST'});const d=await r.json();toast(d.message||d.error,'info');
+      try{await fetch('/api/video-server/shutdown',{method:'POST'});
         const el=document.getElementById('video-server-status');el.textContent='Video服务器: 离线';el.style.background='#7f1d1d';el.style.color='#fca5a5';
-        setTimeout(checkVideoServer,5000);
+        toast('Video 服务器已关闭','info');setTimeout(checkVideoServer,3000);
       }catch{toast('关闭失败','error');}
     }
     async function restartVideoServer(){
       if(!confirm('确定要重启 Video 服务器吗？')) return;
-      try{const r=await fetch('/api/video-server/restart',{method:'POST'});const d=await r.json();toast(d.message||d.error,'info');setTimeout(checkVideoServer,4000);}catch{toast('重启失败','error');}
+      const el=document.getElementById('video-server-status');el.textContent='Video服务器: 重启中...';el.style.background='#854d0e';el.style.color='#fef08a';
+      try{await fetch('/api/video-server/restart',{method:'POST'});
+        toast('Video 服务器重启中...','info');setTimeout(checkVideoServer,2000);setTimeout(checkVideoServer,5000);setTimeout(checkVideoServer,8000);
+      }catch{toast('重启失败','error');}
     }
     // 页面加载时检查 Video 服务器状态
     checkVideoServer();setInterval(checkVideoServer,30000);
+    pollVideoLogs();
 
     /* Video 服务器日志 */
     let _vlogPoll=null;
     async function pollVideoLogs(){
       try{
         const r=await fetch('/api/video-server/logs');
-        const logs=await r.json();
-        if(!logs.length){return;}
-        document.getElementById('vlog-panel').style.display='block';
+        const text=await r.json();
         const el=document.getElementById('vlog-content');
-        const colors={info:'#9ca3af',error:'#ef4444',warn:'#f59e0b',success:'#10b981'};
-        el.innerHTML=logs.map(l=>`<div style="color:${colors[l.level]||colors.info}"><span style="color:#6b7280">${l.time}</span> ${l.message}</div>`).join('');
+        if(!text){
+          el.innerHTML='<div style="color:#6b7280">暂无日志</div>';
+          return;
+        }
+        // 纯文本日志，按行渲染并染色
+        const lines=(typeof text==='string'?text:JSON.stringify(text,null,2)).split('\n').filter(l=>l.trim());
+        el.innerHTML=lines.map(l=>{
+          let color='#9ca3af';
+          if(l.includes('[error]'))color='#ef4444';
+          else if(l.includes('[warn]'))color='#f59e0b';
+          else if(l.includes('[success]'))color='#10b981';
+          return `<div style="color:${color}">${l.replace(/</g,'&lt;')}</div>`;
+        }).join('');
         el.scrollTop=el.scrollHeight;
-      }catch{}
+      }catch{
+        document.getElementById('vlog-content').innerHTML='<div style="color:#6b7280">无法读取日志</div>';
+      }
     }
   </script>
 </body>
