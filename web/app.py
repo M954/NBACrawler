@@ -895,6 +895,159 @@ def api_restart():
     return jsonify({"message": "服务器正在重启..."})
 
 
+# ── Video 服务器代理 ──────────────────────────────────────
+VIDEO_SERVER = "http://localhost:8000"
+
+
+@app.route("/api/video-server/health")
+def api_video_server_health():
+    """检查 Video 服务器状态。"""
+    import urllib.request, urllib.error
+    try:
+        resp = urllib.request.urlopen(f"{VIDEO_SERVER}/health", timeout=2)
+        data = json.loads(resp.read().decode("utf-8"))
+        # 验证返回的是有效的 health response
+        if data.get("status") == "ok":
+            return jsonify({"online": True, **data})
+        return jsonify({"online": False})
+    except Exception:
+        return jsonify({"online": False})
+
+
+@app.route("/api/video-server/start", methods=["POST"])
+def api_video_server_start():
+    """启动 Video 服务器。"""
+    import subprocess, sys
+    video_dir = Path(__file__).resolve().parent.parent.parent / "NBAVedio"
+    if not video_dir.exists():
+        _log(f"NBAVedio 目录不存在: {video_dir}", "error")
+        return jsonify({"error": f"NBAVedio 目录不存在: {video_dir}"}), 404
+    # 检查是否已经在运行
+    import urllib.request, urllib.error
+    try:
+        urllib.request.urlopen(f"{VIDEO_SERVER}/health", timeout=3)
+        _log("Video 服务器已在运行。")
+        return jsonify({"message": "Video 服务器已在运行"})
+    except Exception:
+        pass
+    try:
+        # 先测试 import 是否正常
+        check = subprocess.run(
+            [sys.executable, "-c", "from tweet_api import app"],
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+            cwd=str(video_dir),
+        )
+        if check.returncode != 0:
+            err_msg = check.stderr.strip().split("\n")[-1] if check.stderr else "未知错误"
+            _log(f"Video 服务器启动失败: {err_msg}", "error")
+            return jsonify({"error": f"Video 服务器启动失败: {err_msg}"}), 500
+        subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "tweet_api:app",
+             "--host", "0.0.0.0", "--port", "8000"],
+            cwd=str(video_dir),
+        )
+        _log("Video 服务器已启动。")
+        return jsonify({"message": "Video 服务器启动中..."})
+    except Exception as e:
+        _log(f"Video 服务器启动异常: {e}", "error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/video-server/shutdown", methods=["POST"])
+def api_video_server_shutdown():
+    """关闭 Video 服务器（通过查找端口占用进程并终止）。"""
+    import subprocess
+    try:
+        # 查找占用 8000 端口的进程及其所有子进程
+        ps_cmd = (
+            "$conns = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue; "
+            "if ($conns) { "
+            "  $pids = @($conns | ForEach-Object { $_.OwningProcess } | Sort-Object -Unique); "
+            "  # 找到这些进程的子进程\n"
+            "  $children = @(Get-CimInstance Win32_Process | Where-Object { $pids -contains $_.ParentProcessId } | "
+            "    ForEach-Object { $_.ProcessId }); "
+            "  $allPids = @($pids + $children) | Sort-Object -Unique; "
+            "  foreach ($p in $allPids) { & taskkill /F /PID $p 2>&1 | Out-Null }; "
+            "  ($allPids -join ',') "
+            "} else { 'NONE' }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
+        )
+        output = (result.stdout or "").strip()
+        if output == "NONE" or not output:
+            return jsonify({"message": "Video 服务器未在运行"})
+        _log(f"Video 服务器已关闭 (PID={output})。", "warn")
+        return jsonify({"message": f"Video 服务器已关闭 (PID={output})"})
+    except Exception as e:
+        _log(f"关闭 Video 服务器失败: {e}", "error")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/video-server/restart", methods=["POST"])
+def api_video_server_restart():
+    """重启 Video 服务器。"""
+    import time as _time
+    api_video_server_shutdown()
+    _time.sleep(2)
+    return api_video_server_start()
+
+
+@app.route("/api/video-server/logs")
+def api_video_server_logs():
+    """代理获取 Video 服务器日志。"""
+    import urllib.request, urllib.error
+    try:
+        resp = urllib.request.urlopen(f"{VIDEO_SERVER}/logs", timeout=5)
+        data = json.loads(resp.read().decode("utf-8"))
+        return jsonify(data)
+    except Exception:
+        return jsonify([])
+
+
+@app.route("/api/generated-videos", methods=["GET", "DELETE"])
+def api_generated_videos():
+    """代理获取或删除全部已生成的视频。"""
+    import urllib.request, urllib.error
+    if request.method == "DELETE":
+        try:
+            req = urllib.request.Request(f"{VIDEO_SERVER}/videos", method="DELETE")
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = json.loads(resp.read().decode("utf-8"))
+            return jsonify(data)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    try:
+        resp = urllib.request.urlopen(f"{VIDEO_SERVER}/videos", timeout=5)
+        data = json.loads(resp.read().decode("utf-8"))
+        return jsonify(data)
+    except Exception:
+        return jsonify([])
+
+
+@app.route("/api/generated-video/<filename>", methods=["GET", "DELETE"])
+def api_generated_video(filename):
+    """代理获取或删除已生成的视频文件。"""
+    import urllib.request, urllib.error
+    if ".." in filename or "/" in filename or "\\" in filename:
+        return "非法文件名", 400
+    if request.method == "DELETE":
+        try:
+            req = urllib.request.Request(f"{VIDEO_SERVER}/video/{filename}", method="DELETE")
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = json.loads(resp.read().decode("utf-8"))
+            return jsonify(data)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    try:
+        resp = urllib.request.urlopen(f"{VIDEO_SERVER}/video/{filename}", timeout=30)
+        from flask import Response
+        return Response(resp.read(), mimetype="video/mp4")
+    except Exception:
+        return "视频未找到", 404
+
+
 def _run_tweet_scraper() -> None:
     """在后台线程中运行推文爬虫。"""
     global _tweet_status, _tweets
@@ -1575,7 +1728,8 @@ def api_generate_videos():
         return jsonify({"error": "视频生成正在运行中"}), 409
     data = request.get_json(silent=True) or {}
     tweet_ids = data.get("tweet_ids", [])
-    _video_gen_thread = threading.Thread(target=_run_video_generation, args=(tweet_ids,), daemon=True)
+    backend = data.get("backend", None)
+    _video_gen_thread = threading.Thread(target=_run_video_generation, args=(tweet_ids, backend), daemon=True)
     _video_gen_thread.start()
     with _tweets_lock:
         if tweet_ids:
@@ -1601,8 +1755,8 @@ _video_gen_status: str = "idle"
 _video_gen_thread: threading.Thread | None = None
 
 
-def _run_video_generation(tweet_ids=None):
-    """后台执行视频生成（使用 urllib）。tweet_ids 为空则生成所有无视频的推文。"""
+def _run_video_generation(tweet_ids=None, backend=None):
+    """后台执行视频生成（使用 urllib）。tweet_ids 为空则生成所有无视频的推文。backend: claude/gpt。"""
     global _video_gen_status, _tweets
     _video_gen_status = "running"
     start_time = time.time()
@@ -1644,11 +1798,26 @@ def _run_video_generation(tweet_ids=None):
             body += b"Content-Type: image/jpeg\r\n\r\n"
             body += image_file.read_bytes()
             body += b"\r\n"
-            for key, val in [("translations", content_cn), ("authors", author), ("original_texts", content_en), ("duration", "8")]:
+            for key, val in [("translations", content_cn), ("authors", author), ("original_texts", content_en), ("duration", "8")] + ([("backend", backend)] if backend else []):
                 body += f"--{boundary}\r\n".encode()
                 body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
                 body += val.encode("utf-8")
                 body += b"\r\n"
+
+            # 如果推文有本地视频，附加上传
+            tweet_video_url = tweet.get("video_url", "")
+            if tweet_video_url:
+                # video_url 格式: /video/tweet_xxx.mp4
+                video_filename = tweet_video_url.split("/")[-1]
+                video_file = Path(__file__).resolve().parent.parent / "output" / "videos" / video_filename
+                if video_file.exists():
+                    body += f"--{boundary}\r\n".encode()
+                    body += f'Content-Disposition: form-data; name="video"; filename="{video_file.name}"\r\n'.encode()
+                    body += b"Content-Type: video/mp4\r\n\r\n"
+                    body += video_file.read_bytes()
+                    body += b"\r\n"
+                    print(f"  Video [{i+1}/{len(pending)}] 附带推文视频: {video_file.name}")
+
             body += f"--{boundary}--\r\n".encode()
 
             try:

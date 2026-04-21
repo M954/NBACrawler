@@ -83,6 +83,7 @@
   <main>
     <div class="tab-bar">
       <button class="tab-btn active" onclick="switchTab('tweets',this)">🐦 球星推文</button>
+      <button class="tab-btn" onclick="switchTab('videos',this)">🎬 生成视频</button>
       <button class="tab-btn" onclick="switchTab('news',this)">📰 资讯列表</button>
     </div>
 
@@ -97,10 +98,17 @@
       <div class="action-bar">
         <button class="btn btn-primary" id="btn-scrape" onclick="startTweetScraper()">🐦 抓取推文</button>
         <button class="btn btn-stop" id="btn-stop-scrape" onclick="stopTweetScraper()" style="display:none">⏹ 停止抓取</button>
-        <button class="btn btn-video" id="btn-video" onclick="startVideoGen()">🎬 生成视频</button>
+        <button class="btn btn-video" id="btn-video" onclick="startVideoGen()" disabled>🎬 生成视频</button>
+        <select id="ai-backend" style="padding:0.5rem 0.8rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--text);font-size:0.9rem"><option value="claude">Claude Opus 4.6</option><option value="gpt">Azure GPT</option></select>
         <button class="btn" style="background:#6366f1;color:#fff;display:none" id="btn-select-all" onclick="toggleSelectAll()">☑ 全选待生成</button>
-        <button class="btn" style="background:#ef4444;color:#fff" onclick="shutdownServer()">⏹ 关闭服务器</button>
-        <button class="btn" style="background:#f59e0b;color:#fff" onclick="restartServer()">🔄 重启服务器</button>
+        <span id="video-server-status" style="font-size:0.85rem;padding:0.5rem 0.8rem;border-radius:8px;background:#374151;color:#9ca3af">Video服务器: --</span>
+        <button class="btn" style="background:#10b981;color:#fff" onclick="startVideoServer()">▶ 启动Video</button>
+        <button class="btn" style="background:#ef4444;color:#fff" onclick="shutdownVideoServer()">⏹ 关闭Video</button>
+        <button class="btn" style="background:#f59e0b;color:#fff" onclick="restartVideoServer()">🔄 重启Video</button>
+        <button class="btn" style="background:#ef4444;color:#fff" onclick="shutdownServer()">⏹ 关闭Crawler</button>
+        <button class="btn" style="background:#f59e0b;color:#fff" onclick="restartServer()">🔄 重启Crawler</button>
+      </div>
+      <div class="action-bar">
         <select id="player-filter" onchange="onPlayerFilter()"><option value="">全部球星</option></select>
         <input type="text" id="tweet-search" placeholder="搜索推文..." oninput="filterTweets()">
       </div>
@@ -110,7 +118,7 @@
       </div>
 
       <!-- 服务日志面板 -->
-      <div id="log-panel" style="max-width:680px;margin:0 auto 1rem;display:none">
+      <div id="log-panel" style="max-width:960px;margin:0 auto 1rem;display:none">
         <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
           <div style="display:flex;justify-content:space-between;align-items:center;padding:0.6rem 1rem;background:var(--border);cursor:pointer" onclick="document.getElementById('log-content').style.display=document.getElementById('log-content').style.display==='none'?'':'none'">
             <span style="font-weight:600;font-size:0.9rem">📋 服务日志</span>
@@ -120,10 +128,33 @@
         </div>
       </div>
 
+      <div id="vlog-panel" style="max-width:960px;margin:0 auto 1rem;display:none">
+        <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:0.6rem 1rem;background:var(--border);cursor:pointer" onclick="document.getElementById('vlog-content').style.display=document.getElementById('vlog-content').style.display==='none'?'':'none'">
+            <span style="font-weight:600;font-size:0.9rem">🎬 Video服务器日志</span>
+            <span style="font-size:0.75rem;color:var(--text-muted)">点击展开/折叠</span>
+          </div>
+          <div id="vlog-content" style="max-height:400px;overflow-y:auto;padding:0.5rem;font-family:monospace;font-size:0.8rem;line-height:1.6"></div>
+        </div>
+      </div>
+
       <div class="tweet-feed" id="tweet-feed"></div>
       <div style="text-align:center;padding:2rem 0">
         <div class="pagination" id="tweet-pagination" style="display:flex;justify-content:center;gap:6px;margin-top:1rem;flex-wrap:wrap"></div>
       </div>
+    </div>
+
+    <!-- ====== 视频 Tab ====== -->
+    <div id="tab-videos" style="display:none">
+      <div class="mini-stats">
+        <div class="mini-stat">🎬 <strong id="vs-total">0</strong> 视频</div>
+        <div class="mini-stat">💾 <strong id="vs-size">0</strong> MB</div>
+      </div>
+      <div class="action-bar">
+        <button class="btn btn-primary" onclick="loadGeneratedVideos()">🔄 刷新列表</button>
+        <button class="btn" style="background:#ef4444;color:#fff" onclick="deleteAllVideos()">🗑 删除全部</button>
+      </div>
+      <div class="tweet-feed" id="video-list"></div>
     </div>
 
     <!-- ====== 资讯 Tab ====== -->
@@ -170,7 +201,7 @@
     function openLightbox(src){document.getElementById('lightbox-img').src=src;document.getElementById('lightbox').classList.add('show');}
     function closeLightbox(){document.getElementById('lightbox').classList.remove('show');}
 
-    function switchTab(tab,btn){document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');document.getElementById('tab-news').style.display=tab==='news'?'':'none';document.getElementById('tab-tweets').style.display=tab==='tweets'?'':'none';if(tab==='tweets'){loadTweets();loadPlayers();}if(tab==='news')loadArticles();}
+    function switchTab(tab,btn){document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');document.getElementById('tab-news').style.display=tab==='news'?'':'none';document.getElementById('tab-tweets').style.display=tab==='tweets'?'':'none';document.getElementById('tab-videos').style.display=tab==='videos'?'':'none';if(tab==='tweets'){loadTweets();loadPlayers();}if(tab==='news')loadArticles();if(tab==='videos')loadGeneratedVideos();}
 
     async function loadPlayers(){try{const r=await fetch('/api/players');if(!r.ok)return;_players=await r.json();const s=document.getElementById('player-filter'),c=_selPlayer;s.innerHTML='<option value="">全部球星</option>'+_players.map(p=>`<option value="${esc(p.handle)}">${esc(p.name)}</option>`).join('');if(c)s.value=c;}catch{}}
 
@@ -321,7 +352,8 @@
     }
     async function startVideoGen(){
       const checked=[...document.querySelectorAll('.tweet-checkbox:checked')].map(cb=>cb.dataset.tid);
-      const body=checked.length>0?{tweet_ids:checked}:{};
+      const backend=document.getElementById('ai-backend').value;
+      const body=checked.length>0?{tweet_ids:checked,backend}:{backend};
       try{
         const r=await fetch('/api/generate-videos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
         const d=await r.json();if(!r.ok){toast(d.error,'error');return;}
@@ -329,8 +361,47 @@
         document.getElementById('video-progress').classList.add('active');
         toast(`视频生成已启动 (${d.count} 条)`,'success');
         if(!_vPoll)_vPoll=setInterval(pollVideo,3000);
+        document.getElementById('vlog-panel').style.display='block';
+        document.getElementById('vlog-content').innerHTML='<div style="color:#9ca3af">正在连接 Video 服务器...</div>';
+        pollVideoLogs();
+        if(!_vlogPoll)_vlogPoll=setInterval(pollVideoLogs,3000);
       }catch(e){toast('失败','error');}}
-    async function pollVideo(){try{const r=await fetch('/api/video-status');const d=await r.json();const p=d.total>0?Math.round(d.with_video/d.total*100):0;document.getElementById('vp-fill').style.width=p+'%';document.getElementById('vp-text').textContent=`视频: ${d.with_video}/${d.total} (${p}%)`;if(d.status==='idle'){document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';document.getElementById('video-progress').classList.remove('active');if(_vPoll){clearInterval(_vPoll);_vPoll=null;}await loadTweets();toast(`视频完成 ${d.with_video}/${d.total}`,'success');}}catch{}}
+    async function pollVideo(){try{const r=await fetch('/api/video-status');const d=await r.json();const p=d.total>0?Math.round(d.with_video/d.total*100):0;document.getElementById('vp-fill').style.width=p+'%';document.getElementById('vp-text').textContent=`视频: ${d.with_video}/${d.total} (${p}%)`;await pollVideoLogs();if(d.status==='idle'){document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';document.getElementById('video-progress').classList.remove('active');if(_vPoll){clearInterval(_vPoll);_vPoll=null;}if(_vlogPoll){clearInterval(_vlogPoll);_vlogPoll=null;}await loadTweets();toast(`视频完成 ${d.with_video}/${d.total}`,'success');}}catch{}}
+
+    /* 生成视频列表 */
+    async function deleteVideo(filename){
+      if(!confirm(`确定删除 ${filename}？`))return;
+      try{const r=await fetch(`/api/generated-video/${filename}`,{method:'DELETE'});const d=await r.json();toast(d.message||d.error,r.ok?'success':'error');loadGeneratedVideos();}catch{toast('删除失败','error');}
+    }
+    async function deleteAllVideos(){
+      if(!confirm('确定删除所有生成的视频？此操作不可撤销！'))return;
+      try{const r=await fetch('/api/generated-videos',{method:'DELETE'});const d=await r.json();toast(d.message||d.error,r.ok?'success':'error');loadGeneratedVideos();}catch{toast('删除失败','error');}
+    }
+    async function loadGeneratedVideos(){
+      const list=document.getElementById('video-list');
+      try{
+        const r=await fetch('/api/generated-videos');
+        const videos=await r.json();
+        document.getElementById('vs-total').textContent=videos.length;
+        const totalMB=videos.reduce((s,v)=>s+v.size_mb,0);
+        document.getElementById('vs-size').textContent=totalMB.toFixed(1);
+        if(!videos.length){
+          list.innerHTML='<div style="text-align:center;padding:3rem;color:var(--text-muted)"><div style="font-size:3rem">🎬</div><p>暂无生成视频</p><p>在推文tab选择推文后点击"生成视频"</p></div>';
+          return;
+        }
+        list.innerHTML=videos.map((v,i)=>`<div class="tweet-item" style="animation-delay:${i*0.04}s">
+          <div class="tweet-header">
+            <div class="tweet-avatar">🎬</div>
+            <div class="tweet-author"><div class="tweet-author-name">${esc(v.filename)}</div><div class="tweet-author-handle">${v.size_mb} MB · ${v.created}</div></div>
+            <button class="btn" style="background:#ef4444;color:#fff;padding:4px 10px;font-size:0.8rem;margin-left:auto" onclick="deleteVideo('${esc(v.filename)}')">🗑 删除</button>
+          </div>
+          <div class="tweet-video"><video controls preload="metadata" style="max-width:100%;border-radius:8px"><source src="/api/generated-video/${esc(v.filename)}" type="video/mp4"></video></div>
+          <div class="tweet-footer"><a href="/api/generated-video/${esc(v.filename)}" download="${esc(v.filename)}">下载视频 ↓</a></div>
+        </div>`).join('');
+      }catch{
+        list.innerHTML='<div style="text-align:center;padding:2rem;color:var(--text-muted)">Video服务器离线，无法加载视频列表</div>';
+      }
+    }
 
     /* 资讯 */
     async function loadArticles(){try{const r=await fetch('/api/articles');if(!r.ok)return;_articles=await r.json();const c=document.getElementById('article-list');c.className='article-grid';if(!_articles.length){c.innerHTML='<div class="empty-state"><div class="empty-icon">📭</div><p>暂无资讯</p></div>';return;}c.innerHTML=_articles.slice(0,20).map((a,i)=>`<article class="article-card" style="--i:${i}"><div class="card-top"><span class="source-badge">${esc(a.source)}</span></div><h2 class="title-cn">${esc(a.title_cn||a.title)}</h2><p class="title-en">${esc(a.title)}</p><p class="summary">${esc(a.summary_cn||a.summary||'')}</p><div class="card-footer"><span class="date">🕐 ${ago(a.publish_date)}</span><a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer" class="read-link">阅读原文 →</a></div></article>`).join('');document.getElementById('stat-total').textContent=_articles.length;document.getElementById('stat-translated').textContent=_articles.filter(a=>a.translation_status==='completed').length;document.getElementById('stat-sources').textContent=new Set(_articles.map(a=>a.source)).size;}catch{}}
@@ -353,6 +424,51 @@
       }catch{}
       toast('服务器重启中，3秒后刷新页面...','info');
       setTimeout(()=>{location.reload();},3000);
+    }
+
+    /* Video 服务器管理 */
+    async function checkVideoServer(){
+      try{
+        const r=await fetch('/api/video-server/health');
+        const d=await r.json();
+        const el=document.getElementById('video-server-status');
+        if(d.online){el.textContent='Video服务器: 在线';el.style.background='#065f46';el.style.color='#6ee7b7';}
+        else{el.textContent='Video服务器: 离线';el.style.background='#7f1d1d';el.style.color='#fca5a5';}
+      }catch{
+        const el=document.getElementById('video-server-status');
+        el.textContent='Video服务器: 未知';el.style.background='#374151';el.style.color='#9ca3af';
+      }
+    }
+    async function startVideoServer(){
+      try{const r=await fetch('/api/video-server/start',{method:'POST'});const d=await r.json();toast(d.message||d.error,'info');setTimeout(checkVideoServer,3000);}catch{toast('启动失败','error');}
+    }
+    async function shutdownVideoServer(){
+      if(!confirm('确定要关闭 Video 服务器吗？')) return;
+      try{const r=await fetch('/api/video-server/shutdown',{method:'POST'});const d=await r.json();toast(d.message||d.error,'info');
+        const el=document.getElementById('video-server-status');el.textContent='Video服务器: 离线';el.style.background='#7f1d1d';el.style.color='#fca5a5';
+        setTimeout(checkVideoServer,5000);
+      }catch{toast('关闭失败','error');}
+    }
+    async function restartVideoServer(){
+      if(!confirm('确定要重启 Video 服务器吗？')) return;
+      try{const r=await fetch('/api/video-server/restart',{method:'POST'});const d=await r.json();toast(d.message||d.error,'info');setTimeout(checkVideoServer,4000);}catch{toast('重启失败','error');}
+    }
+    // 页面加载时检查 Video 服务器状态
+    checkVideoServer();setInterval(checkVideoServer,30000);
+
+    /* Video 服务器日志 */
+    let _vlogPoll=null;
+    async function pollVideoLogs(){
+      try{
+        const r=await fetch('/api/video-server/logs');
+        const logs=await r.json();
+        if(!logs.length){return;}
+        document.getElementById('vlog-panel').style.display='block';
+        const el=document.getElementById('vlog-content');
+        const colors={info:'#9ca3af',error:'#ef4444',warn:'#f59e0b',success:'#10b981'};
+        el.innerHTML=logs.map(l=>`<div style="color:${colors[l.level]||colors.info}"><span style="color:#6b7280">${l.time}</span> ${l.message}</div>`).join('');
+        el.scrollTop=el.scrollHeight;
+      }catch{}
     }
   </script>
 </body>
