@@ -99,6 +99,7 @@
         <button class="btn btn-primary" id="btn-scrape" onclick="startTweetScraper()">🐦 抓取推文</button>
         <button class="btn btn-stop" id="btn-stop-scrape" onclick="stopTweetScraper()" style="display:none">⏹ 停止抓取</button>
         <button class="btn btn-video" id="btn-video" onclick="startVideoGen()" disabled>🎬 生成视频</button>
+        <button class="btn btn-stop" id="btn-stop-video" onclick="stopVideoGen()" style="display:none">⏹ 停止生成</button>
         <select id="ai-backend" style="padding:0.5rem 0.8rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--text);font-size:0.9rem"><option value="claude">Claude Opus 4.6</option><option value="gpt">Azure GPT</option></select>
         <button class="btn" style="background:#6366f1;color:#fff;display:none" id="btn-select-all" onclick="toggleSelectAll()">☑ 全选待生成</button>
         <span id="video-server-status" style="font-size:0.85rem;padding:0.5rem 0.8rem;border-radius:8px;background:#374151;color:#9ca3af">Video服务器: --</span>
@@ -264,6 +265,7 @@
     /* 推文爬虫 */
     async function startTweetScraper(){try{const r=await fetch('/api/scrape-tweets',{method:'POST'});const d=await r.json();if(!r.ok){toast(d.error,'error');return;}document.getElementById('btn-scrape').disabled=true;document.getElementById('btn-scrape').textContent='⏳ 抓取中...';document.getElementById('btn-stop-scrape').style.display='';document.getElementById('log-panel').style.display='block';document.getElementById('log-content').innerHTML='<div style="color:var(--text-muted)">正在启动抓取...</div>';toast('推文爬虫已启动','success');if(!_tPoll)_tPoll=setInterval(pollTweet,3000);}catch(e){toast('失败','error');}}
     async function stopTweetScraper(){try{await fetch('/api/stop-tweets',{method:'POST'});document.getElementById('btn-stop-scrape').style.display='none';document.getElementById('btn-scrape').disabled=false;document.getElementById('btn-scrape').textContent='🐦 抓取推文';toast('已请求停止抓取','info');}catch{}}
+    async function stopVideoGen(){try{await fetch('/api/video-server/cancel',{method:'POST'});document.getElementById('btn-stop-video').style.display='none';document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';toast('已请求停止视频生成','info');}catch{toast('停止失败','error');}}
     async function pollTweet(){
       try{
         const r=await fetch('/api/tweet-status');
@@ -358,6 +360,7 @@
         const r=await fetch('/api/generate-videos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
         const d=await r.json();if(!r.ok){toast(d.error,'error');return;}
         document.getElementById('btn-video').disabled=true;document.getElementById('btn-video').textContent='⏳ 生成中...';
+        document.getElementById('btn-stop-video').style.display='';
         document.getElementById('video-progress').classList.add('active');
         toast(`视频生成已启动 (${d.count} 条)`,'success');
         _videoGenCount=d.count;
@@ -368,7 +371,7 @@
         pollVideoLogs();
         if(!_vlogPoll)_vlogPoll=setInterval(pollVideoLogs,3000);
       }catch(e){toast('失败','error');}}
-    async function pollVideo(){try{const r=await fetch('/api/video-status');const d=await r.json();const done=d.gen_current||0;const total=d.gen_total||1;const p=total>0?Math.min(Math.round(done/total*100),100):0;document.getElementById('vp-fill').style.width=p+'%';document.getElementById('vp-text').textContent=`视频生成: ${done}/${total} (${p}%)`;await pollVideoLogs();if(d.status==='idle'){document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';document.getElementById('video-progress').classList.remove('active');if(_vPoll){clearInterval(_vPoll);_vPoll=null;}if(_vlogPoll){clearInterval(_vlogPoll);_vlogPoll=null;}if(_videoGenCount>0){_videoGenCount=0;_videoGenBefore=0;await loadTweets();toast('视频生成完成','success');}}}catch{}}
+    async function pollVideo(){try{const r=await fetch(`/api/video-status?ts=${Date.now()}`,{cache:'no-store'});const d=await r.json();const done=d.gen_current||0;const total=d.gen_total||1;const p=total>0?Math.min(Math.round(done/total*100),100):0;const lastLog=(d.video_last_log||'').replace(/^\[[^\]]+\]\s*\[[^\]]+\]\s*/,'');document.getElementById('vp-fill').style.width=p+'%';document.getElementById('vp-text').textContent=lastLog?`视频生成: ${done}/${total} (${p}%) · ${lastLog}`:`视频生成: ${done}/${total} (${p}%)`;await pollVideoLogs();if(d.status==='idle'){document.getElementById('btn-video').disabled=false;document.getElementById('btn-video').textContent='🎬 生成视频';document.getElementById('btn-stop-video').style.display='none';document.getElementById('video-progress').classList.remove('active');if(_vPoll){clearInterval(_vPoll);_vPoll=null;}if(_vlogPoll){clearInterval(_vlogPoll);_vlogPoll=null;}if(_videoGenCount>0){_videoGenCount=0;_videoGenBefore=0;await loadTweets();toast('视频生成完成','success');}}}catch{}}
 
     /* 生成视频列表 */
     async function deleteVideo(filename){
@@ -469,7 +472,7 @@
     let _vlogPoll=null;
     async function pollVideoLogs(){
       try{
-        const r=await fetch('/api/video-server/logs');
+        const r=await fetch(`/api/video-server/logs?ts=${Date.now()}`,{cache:'no-store'});
         const text=await r.json();
         const el=document.getElementById('vlog-content');
         if(!text){

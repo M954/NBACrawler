@@ -899,6 +899,18 @@ def api_restart():
 VIDEO_SERVER = "http://localhost:8000"
 
 
+def _read_video_log_tail(max_lines: int = 120) -> str:
+    """读取 Video 服务日志尾部，减少前端拉取体积并避免停在旧内容。"""
+    log_file = Path(__file__).resolve().parent.parent.parent / "NBAVedio" / "output" / "logs" / "video.log"
+    if not log_file.exists():
+        return ""
+    try:
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        return "\n".join(lines[-max_lines:]).strip()
+    except Exception:
+        return ""
+
+
 @app.route("/api/video-server/health")
 def api_video_server_health():
     """检查 Video 服务器状态。"""
@@ -994,26 +1006,40 @@ def api_video_server_restart():
     return api_video_server_start()
 
 
+@app.route("/api/video-server/cancel", methods=["POST"])
+def api_video_server_cancel():
+    """取消 Video 服务器当前的视频生成任务。"""
+    import urllib.request, urllib.error
+    try:
+        req = urllib.request.Request(f"{VIDEO_SERVER}/cancel", method="POST",
+                                     headers={"Content-Type": "application/json"}, data=b"{}")
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode("utf-8"))
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/video-server/logs")
 def api_video_server_logs():
     """获取 Video 服务器日志（优先读本地日志文件，fallback 到 API）。"""
-    log_file = Path(__file__).resolve().parent.parent.parent / "NBAVedio" / "output" / "logs" / "video.log"
-    if log_file.exists():
-        try:
-            content = log_file.read_text(encoding="utf-8").strip()
-            if content:
-                return jsonify(content)
-            return jsonify("")
-        except Exception:
-            pass
+    content = _read_video_log_tail(max_lines=120)
+    if content:
+        response = jsonify(content)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
     # fallback: 从 video server API 获取
     import urllib.request, urllib.error
     try:
         resp = urllib.request.urlopen(f"{VIDEO_SERVER}/logs", timeout=5)
         data = json.loads(resp.read().decode("utf-8"))
-        return jsonify(data)
+        response = jsonify(data)
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
     except Exception:
-        return jsonify("")
+        response = jsonify("")
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
 
 
 @app.route("/api/generated-videos", methods=["GET", "DELETE"])
@@ -1753,14 +1779,17 @@ def api_generate_videos():
 def api_video_status():
     """视频生成状态。"""
     with_video = sum(1 for t in _tweets if t.get("video_url") and len(str(t.get("video_url", ""))) > 5)
-    return jsonify({
+    response = jsonify({
         "status": _video_gen_status,
         "total": len(_tweets),
         "with_video": with_video,
         "pending": len(_tweets) - with_video,
         "gen_current": _video_gen_progress["current"],
         "gen_total": _video_gen_progress["total"],
+        "video_last_log": _read_video_log_tail(max_lines=1),
     })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 _video_gen_status: str = "idle"
