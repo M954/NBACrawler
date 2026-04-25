@@ -1743,14 +1743,9 @@ def serve_video(filename):
     """提供视频文件（从视频 API 输出目录）。"""
     import re
     from flask import abort, send_from_directory
-    # 安全校验：只允许 tweet_xxxxx.mp4 格式
     if not re.fullmatch(r'tweet_[a-zA-Z0-9_\-]+\.mp4', filename):
         abort(404)
-    # 视频存储目录
-    video_dir = Path("d:/vedio/output/tweet_videos")
-    if not video_dir.exists():
-        # 降级到本地 output 目录
-        video_dir = Path(__file__).resolve().parent.parent / "output" / "videos"
+    video_dir = Path(__file__).resolve().parent.parent / "output" / "videos"
     if not (video_dir / filename).exists():
         abort(404)
     return send_from_directory(str(video_dir), filename, mimetype="video/mp4")
@@ -1765,7 +1760,8 @@ def api_generate_videos():
     data = request.get_json(silent=True) or {}
     tweet_ids = data.get("tweet_ids", [])
     backend = data.get("backend", None)
-    _video_gen_thread = threading.Thread(target=_run_video_generation, args=(tweet_ids, backend), daemon=True)
+    highlight = bool(data.get("highlight", False))
+    _video_gen_thread = threading.Thread(target=_run_video_generation, args=(tweet_ids, backend, highlight), daemon=True)
     _video_gen_thread.start()
     with _tweets_lock:
         if tweet_ids:
@@ -1797,8 +1793,9 @@ _video_gen_thread: threading.Thread | None = None
 _video_gen_progress: dict = {"current": 0, "total": 0}
 
 
-def _run_video_generation(tweet_ids=None, backend=None):
-    """后台执行视频生成（使用 urllib）。tweet_ids 为空则生成所有无视频的推文。backend: claude/gpt。"""
+def _run_video_generation(tweet_ids=None, backend=None, highlight=False):
+    """后台执行视频生成（使用 urllib）。tweet_ids 为空则生成所有无视频的推文。
+    backend: claude/gpt。highlight=True 时让 Video 服务器对带原视频的推文识别高光段并保留原音。"""
     global _video_gen_status, _tweets, _video_gen_progress
     _video_gen_status = "running"
     start_time = time.time()
@@ -1842,7 +1839,7 @@ def _run_video_generation(tweet_ids=None, backend=None):
             body += b"Content-Type: image/jpeg\r\n\r\n"
             body += image_file.read_bytes()
             body += b"\r\n"
-            for key, val in [("translations", content_cn), ("authors", author), ("original_texts", content_en), ("duration", "8")] + ([("backend", backend)] if backend else []):
+            for key, val in [("translations", content_cn), ("authors", author), ("original_texts", content_en), ("duration", "8")] + ([("backend", backend)] if backend else []) + ([("highlight", "1")] if highlight else []):
                 body += f"--{boundary}\r\n".encode()
                 body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
                 body += val.encode("utf-8")

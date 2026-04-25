@@ -101,6 +101,9 @@
         <button class="btn btn-video" id="btn-video" onclick="startVideoGen()" disabled>🎬 生成视频</button>
         <button class="btn btn-stop" id="btn-stop-video" onclick="stopVideoGen()" style="display:none">⏹ 停止生成</button>
         <select id="ai-backend" style="padding:0.5rem 0.8rem;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--text);font-size:0.9rem"><option value="claude">Claude Opus 4.6</option><option value="gpt">Azure GPT</option></select>
+        <label style="display:flex;align-items:center;gap:0.35rem;font-size:0.85rem;color:var(--text);padding:0.5rem 0.6rem;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);cursor:pointer" title="对带原视频的推文，识别高光段并保留原音 + 中译字幕">
+          <input type="checkbox" id="chk-highlight" style="margin:0">高光原声
+        </label>
         <button class="btn" style="background:#6366f1;color:#fff;display:none" id="btn-select-all" onclick="toggleSelectAll()">☑ 全选待生成</button>
         <span id="video-server-status" style="font-size:0.85rem;padding:0.5rem 0.8rem;border-radius:8px;background:#374151;color:#9ca3af">Video服务器: --</span>
         <button class="btn" style="background:#10b981;color:#fff" onclick="startVideoServer()">▶ 启动Video</button>
@@ -355,7 +358,8 @@
     async function startVideoGen(){
       const checked=[...document.querySelectorAll('.tweet-checkbox:checked')].map(cb=>cb.dataset.tid);
       const backend=document.getElementById('ai-backend').value;
-      const body=checked.length>0?{tweet_ids:checked,backend}:{backend};
+      const highlight=document.getElementById('chk-highlight').checked;
+      const body=checked.length>0?{tweet_ids:checked,backend,highlight}:{backend,highlight};
       try{
         const r=await fetch('/api/generate-videos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
         const d=await r.json();if(!r.ok){toast(d.error,'error');return;}
