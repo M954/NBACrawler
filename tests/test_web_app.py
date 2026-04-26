@@ -122,6 +122,7 @@ def test_async_scrape_tweets_falls_back_to_cached_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(web_app, "_fetch_tweets_via_syndication", fake_syndication)
     monkeypatch.setattr(web_app, "_fetch_tweets_via_fxtwitter_refresh", fake_fxtwitter)
     monkeypatch.setattr(web_app, "_fetch_tweets_via_nitter_rss", fake_nitter)
+    monkeypatch.setattr(web_app, "_fetch_tweets_via_nitter_rss_v2", fake_nitter)
     web_app._tweets = [
         {
             "tweet_id": "older",

@@ -32,15 +32,36 @@ _tweets_lock = threading.Lock()
 # ── 运行日志 ─────────────────────────────────────────
 _service_logs: list[dict] = []  # {time, level, msg}
 _MAX_LOGS = 500
+_LOG_FILE = Path(__file__).resolve().parent.parent / "output" / "logs" / "crawler.log"
+_log_file_lock = threading.Lock()
 
 def _log(msg: str, level: str = "info"):
-    """记录服务日志（线程安全）。"""
+    """记录服务日志（线程安全），同时落盘。"""
     from datetime import datetime
     entry = {"time": datetime.now().strftime("%H:%M:%S"), "level": level, "msg": msg}
     _service_logs.append(entry)
     if len(_service_logs) > _MAX_LOGS:
         _service_logs.pop(0)
-    print(f"[{entry['time']}] [{level.upper()}] {msg}")
+    line = f"[{entry['time']}] [{level.upper()}] {msg}"
+    print(line)
+    try:
+        with _log_file_lock:
+            _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _truncate_log_file() -> None:
+    """清空磁盘日志文件（每轮抓取开始时调用）。"""
+    try:
+        with _log_file_lock:
+            _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(_LOG_FILE, "w", encoding="utf-8") as f:
+                f.write("")
+    except Exception:
+        pass
 
 OUTPUT_FILE = Path(__file__).resolve().parent.parent / "output" / "demo_results.json"
 TWEETS_FILE = Path(__file__).resolve().parent.parent / "output" / "tweets.json"
@@ -642,6 +663,7 @@ def _save_articles() -> None:
 def _run_scraper() -> None:
     """在后台线程中运行 RSS 爬虫。"""
     global _status, _articles
+    _truncate_log_file()
     _status = "running"
     try:
         loop = asyncio.new_event_loop()
@@ -957,6 +979,7 @@ def api_video_server_start():
             [sys.executable, "-m", "uvicorn", "tweet_api:app",
              "--host", "0.0.0.0", "--port", "8000"],
             cwd=str(video_dir),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
         )
         _log("Video 服务器已启动。")
         return jsonify({"message": "Video 服务器启动中..."})
@@ -1000,10 +1023,34 @@ def api_video_server_shutdown():
 @app.route("/api/video-server/restart", methods=["POST"])
 def api_video_server_restart():
     """重启 Video 服务器。"""
-    import time as _time
+    import time as _time, subprocess, sys, urllib.request
     api_video_server_shutdown()
-    _time.sleep(2)
-    return api_video_server_start()
+    # 轮询等待端口完全释放，最长 10s
+    for _ in range(20):
+        _time.sleep(0.5)
+        try:
+            urllib.request.urlopen(f"{VIDEO_SERVER}/health", timeout=1)
+        except Exception:
+            break  # 健康检查失败 = 旧进程已死，端口空了
+    else:
+        _log("Video 服务器关闭超时，仍尝试启动新实例。", "warn")
+
+    video_dir = Path(__file__).resolve().parent.parent.parent / "NBAVedio"
+    if not video_dir.exists():
+        _log(f"NBAVedio 目录不存在: {video_dir}", "error")
+        return jsonify({"error": f"NBAVedio 目录不存在: {video_dir}"}), 404
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "tweet_api:app",
+             "--host", "0.0.0.0", "--port", "8000"],
+            cwd=str(video_dir),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+        _log("Video 服务器已重启。")
+        return jsonify({"message": "Video 服务器重启中..."})
+    except Exception as e:
+        _log(f"Video 服务器重启异常: {e}", "error")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/video-server/cancel", methods=["POST"])
@@ -1087,6 +1134,7 @@ def api_generated_video(filename):
 def _run_tweet_scraper() -> None:
     """在后台线程中运行推文爬虫。"""
     global _tweet_status, _tweets
+    _truncate_log_file()
     _tweet_status = "running"
     _set_tweet_source("running", "正在刷新推文来源...")
     _log("开始抓取推文...")
@@ -1232,10 +1280,8 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
             page = await browser.new_page(viewport={"width": 550, "height": 800})
             embed_url = f"https://platform.twitter.com/embed/Tweet.html?id={tid}"
             await page.goto(embed_url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_selector("article", timeout=15000)
-            await page.screenshot(
-                path=str(output_path), type="jpeg", quality=85, full_page=True,
-            )
+            article = await page.wait_for_selector("article", timeout=15000)
+            await article.screenshot(path=str(output_path), type="jpeg", quality=85)
             await page.close()
             with _tweets_lock:
                 for t in _tweets:
@@ -1251,8 +1297,10 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
             except Exception:
                 pass
 
+    _video_sem = asyncio.Semaphore(4)
+
     async def _download_video_one(tid, handle, videos_dir):
-        """通过 fxtwitter API 获取视频 URL 并下载。"""
+        """无脑问 fxtwitter:有视频就下,无视频就静默退出。"""
         video_filename = f"tweet_{tid}.mp4"
         video_path = videos_dir / video_filename
         if video_path.exists() and video_path.stat().st_size > 0:
@@ -1265,49 +1313,67 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
             _log(f"视频缓存命中: {tid}")
             return
 
-        try:
-            fx_url = f"https://api.fxtwitter.com/{handle}/status/{tid}"
-            fx_req = urllib.request.Request(fx_url, headers={
-                "User-Agent": random.choice(UA_LIST),
-                "Accept": "application/json",
-            })
-            fx_resp = urllib.request.urlopen(fx_req, timeout=15)
-            fx_data = json.loads(fx_resp.read().decode("utf-8", errors="replace"))
-            tweet_obj = fx_data.get("tweet", {})
-            media_all = tweet_obj.get("media", {}).get("all", [])
+        async with _video_sem:
+            try:
+                fx_url = f"https://api.fxtwitter.com/{handle}/status/{tid}"
+                fx_req = urllib.request.Request(fx_url, headers={
+                    "User-Agent": random.choice(UA_LIST),
+                    "Accept": "application/json",
+                })
+                fx_resp = await asyncio.to_thread(urllib.request.urlopen, fx_req, timeout=15)
+                fx_data = json.loads(fx_resp.read().decode("utf-8", errors="replace"))
+                tweet_obj = fx_data.get("tweet", {}) or {}
 
-            video_url = None
-            for m in media_all:
-                if m.get("type") == "video" and m.get("url"):
-                    video_url = m["url"]
-                    break
+                def _extract_video(tw):
+                    media = (tw.get("media", {}) or {}).get("all", []) or []
+                    for m in media:
+                        if m.get("type") in ("video", "gif") and m.get("url"):
+                            return m["url"], "self"
+                    quote = tw.get("quote") or {}
+                    if quote:
+                        qmedia = (quote.get("media", {}) or {}).get("all", []) or []
+                        for m in qmedia:
+                            if m.get("type") in ("video", "gif") and m.get("url"):
+                                return m["url"], "quote"
+                    return None, None
 
-            if not video_url:
-                return
+                video_url, src = _extract_video(tweet_obj)
+                media_all = (tweet_obj.get("media", {}) or {}).get("all", []) or []
 
-            # 下载视频
-            vid_req = urllib.request.Request(video_url, headers={
-                "User-Agent": random.choice(UA_LIST),
-            })
-            vid_resp = urllib.request.urlopen(vid_req, timeout=60)
-            with open(str(video_path), "wb") as f:
-                while True:
-                    chunk = vid_resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+                if not video_url:
+                    if media_all:
+                        kinds = ",".join(m.get("type", "?") for m in media_all)
+                        _log(f"无视频(fx确认): {tid} (media: {kinds})")
+                    else:
+                        _log(f"无视频(fx无媒体): {tid}")
+                    return
 
-            with _tweets_lock:
-                for t in _tweets:
-                    if t.get("tweet_id") == tid:
-                        t["video_url"] = f"/video/{video_filename}"
-                        break
-            _save_tweets()
-            size_mb = video_path.stat().st_size / 1024 / 1024
-            _log(f"视频下载完成: {tid} ({size_mb:.1f}MB)")
+                vid_req = urllib.request.Request(video_url, headers={
+                    "User-Agent": random.choice(UA_LIST),
+                })
 
-        except Exception as exc:
-            _log(f"视频下载失败 {tid}: {str(exc)[:60]}", "warn")
+                def _do_download():
+                    vid_resp = urllib.request.urlopen(vid_req, timeout=60)
+                    with open(str(video_path), "wb") as f:
+                        while True:
+                            chunk = vid_resp.read(65536)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+
+                await asyncio.to_thread(_do_download)
+
+                with _tweets_lock:
+                    for t in _tweets:
+                        if t.get("tweet_id") == tid:
+                            t["video_url"] = f"/video/{video_filename}"
+                            break
+                _save_tweets()
+                size_mb = video_path.stat().st_size / 1024 / 1024
+                _log(f"视频新下载完成: {tid} ({size_mb:.1f}MB)", "success")
+
+            except Exception as exc:
+                _log(f"视频下载失败 {tid}: {str(exc)[:60]}", "warn")
 
     try:
         for index, player in enumerate(players):
@@ -1366,7 +1432,7 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                         if not content or len(content) < 5:
                             continue
 
-                        # 检测是否有视频
+                        # 检测是否有视频(仅用于日志提示;实际下载交给 fxtwitter 真值判断)
                         desc_el = item.find("description")
                         desc_text = desc_el.text if desc_el is not None and desc_el.text else ""
                         has_video = ">Video<" in desc_text
@@ -1431,12 +1497,11 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                             task = asyncio.ensure_future(_screenshot_one(tid, covers_dir, browser))
                             screenshot_tasks.append(task)
 
-                        # 5. 有视频则异步下载
-                        if has_video:
-                            videos_dir = settings.output_dir / "videos"
-                            videos_dir.mkdir(parents=True, exist_ok=True)
-                            task = asyncio.ensure_future(_download_video_one(tid, handle, videos_dir))
-                            screenshot_tasks.append(task)
+                        # 5. 无脑尝试下载视频(由 fxtwitter 真值判断,无视频会静默退出)
+                        videos_dir = settings.output_dir / "videos"
+                        videos_dir.mkdir(parents=True, exist_ok=True)
+                        task = asyncio.ensure_future(_download_video_one(tid, handle, videos_dir))
+                        screenshot_tasks.append(task)
 
                     if player_count == 0 and fallback_rt_item is not None:
                         # 没有原创推文，用第一条 RT
@@ -1513,11 +1578,10 @@ async def _fetch_tweets_via_nitter_rss_v2(players) -> list[dict]:
                             task = asyncio.ensure_future(_screenshot_one(rt_tid, covers_dir, browser))
                             screenshot_tasks.append(task)
 
-                        if rt_has_video:
-                            videos_dir = settings.output_dir / "videos"
-                            videos_dir.mkdir(parents=True, exist_ok=True)
-                            task = asyncio.ensure_future(_download_video_one(rt_tid, handle, videos_dir))
-                            screenshot_tasks.append(task)
+                        videos_dir = settings.output_dir / "videos"
+                        videos_dir.mkdir(parents=True, exist_ok=True)
+                        task = asyncio.ensure_future(_download_video_one(rt_tid, handle, videos_dir))
+                        screenshot_tasks.append(task)
 
                     if player_count > 0:
                         fetched = True

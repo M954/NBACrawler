@@ -470,7 +470,7 @@
     }
     // 页面加载时检查 Video 服务器状态
     checkVideoServer();setInterval(checkVideoServer,30000);
-    pollVideoLogs();
+    pollVideoLogs();setInterval(pollVideoLogs,3000);
 
     /* Video 服务器日志 */
     let _vlogPoll=null;
