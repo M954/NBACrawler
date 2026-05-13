@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import sys
 
+from utils.console_encoding import ensure_utf8_console
+ensure_utf8_console()
+
 from cli.app import run_cli
 
 

@@ -5,6 +5,9 @@ import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from utils.console_encoding import ensure_utf8_console
+ensure_utf8_console()
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 # 球星推文种子数据

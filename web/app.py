@@ -10,6 +10,9 @@ import re
 import time
 from pathlib import Path
 
+from utils.console_encoding import ensure_utf8_console
+ensure_utf8_console()
+
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
