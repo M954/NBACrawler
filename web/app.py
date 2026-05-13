@@ -847,7 +847,7 @@ def api_tweet_status():
         "stats": {
             "total": len(all_tweets),
             "players": len(set(t.get("player_handle", "") for t in all_tweets)),
-            "videos": len([t for t in all_tweets if t.get("video_url")]),
+            "videos": len([t for t in all_tweets if t.get("generated_video_url")]),
             "translated": len([t for t in all_tweets if t.get("translation_status") == "completed"]),
         },
     })
@@ -1147,7 +1147,9 @@ def _run_tweet_scraper() -> None:
                 old_by_id = {t["tweet_id"]: t for t in _tweets}
                 # 合并时保留旧条目的本地媒体字段（视频、封面等）
                 LOCAL_FIELDS = ("video_url", "video_path", "video_duration",
-                                "video_resolution", "cover_image_path")
+                                "video_resolution", "cover_image_path",
+                                "generated_video_url", "generated_video_path",
+                                "generated_video_duration", "generated_video_resolution")
                 for t in tweets:
                     tid = t["tweet_id"]
                     if tid in old_by_id:
@@ -1831,14 +1833,14 @@ def api_generate_videos():
         if tweet_ids:
             count = len(tweet_ids)
         else:
-            count = sum(1 for t in _tweets if not t.get("video_url"))
+            count = sum(1 for t in _tweets if not t.get("generated_video_url"))
     return jsonify({"status": "running", "count": count})
 
 
 @app.route("/api/video-status")
 def api_video_status():
     """视频生成状态。"""
-    with_video = sum(1 for t in _tweets if t.get("video_url") and len(str(t.get("video_url", ""))) > 5)
+    with_video = sum(1 for t in _tweets if t.get("generated_video_url") and len(str(t.get("generated_video_url", ""))) > 5)
     response = jsonify({
         "status": _video_gen_status,
         "total": len(_tweets),
@@ -1874,7 +1876,7 @@ def _run_video_generation(tweet_ids=None, backend=None, highlight=False):
                 tid_set = set(tweet_ids)
                 pending = [t for t in _tweets if t.get("tweet_id") in tid_set]
             else:
-                pending = [t for t in _tweets if not t.get("video_url")]
+                pending = [t for t in _tweets if not t.get("generated_video_url")]
         _video_gen_progress = {"current": 0, "total": len(pending)}
         print(f"Video generation: {len(pending)} tweets pending")
 
@@ -1903,7 +1905,7 @@ def _run_video_generation(tweet_ids=None, backend=None, highlight=False):
             body += b"Content-Type: image/jpeg\r\n\r\n"
             body += image_file.read_bytes()
             body += b"\r\n"
-            for key, val in [("translations", content_cn), ("authors", author), ("original_texts", content_en), ("duration", "8")] + ([("backend", backend)] if backend else []) + ([("highlight", "1")] if highlight else []):
+            for key, val in [("translations", content_cn), ("authors", author), ("original_texts", content_en), ("duration", "8"), ("tweet_id", str(tweet.get("tweet_id","")))] + ([("backend", backend)] if backend else []) + ([("highlight", "1")] if highlight else []):
                 body += f"--{boundary}\r\n".encode()
                 body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
                 body += val.encode("utf-8")
@@ -1934,10 +1936,10 @@ def _run_video_generation(tweet_ids=None, backend=None, highlight=False):
                 result = json.loads(resp.read().decode("utf-8"))
 
                 with _tweets_lock:
-                    tweet["video_url"] = result.get("video_url", "")
-                    tweet["video_path"] = result.get("video_path", "")
-                    tweet["video_duration"] = result.get("duration", 0)
-                    tweet["video_resolution"] = result.get("resolution", "")
+                    tweet["generated_video_url"] = result.get("video_url", "")
+                    tweet["generated_video_path"] = result.get("video_path", "")
+                    tweet["generated_video_duration"] = result.get("duration", 0)
+                    tweet["generated_video_resolution"] = result.get("resolution", "")
                 _save_tweets()
                 score = result.get("ai_enhanced", {}).get("review", {}).get("score", "")
                 print(f"  Video [{i+1}/{len(pending)}] @{tweet.get('player_handle')}: OK (score: {score})")

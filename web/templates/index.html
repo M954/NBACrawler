@@ -56,6 +56,10 @@
     .lightbox img { max-width:95%; max-height:90vh; border-radius:8px; }
     .lightbox-close { position:absolute; top:20px; right:30px; color:#fff; font-size:2rem; cursor:pointer; z-index:1000; }
     @media(max-width:768px) { .tweet-feed,.action-bar,.mini-stats { padding:0 0.5rem; } }
+    .date-preset { padding:4px 10px; border-radius:14px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:0.8rem; cursor:pointer; transition:var(--transition); }
+    .date-preset:hover { border-color:var(--primary); }
+    .date-preset.active { background:var(--primary); color:#fff; border-color:var(--primary); }
+    #date-panel input[type="date"] { padding:0.4rem 0.6rem; border-radius:6px; border:1px solid var(--border); background:var(--bg-card); color:var(--text); font-size:0.85rem; }
   </style>
 </head>
 <body>
@@ -114,6 +118,34 @@
       </div>
       <div class="action-bar">
         <select id="player-filter" onchange="onPlayerFilter()"><option value="">全部球星</option></select>
+        <div class="date-filter-wrap" style="position:relative">
+          <button type="button" class="btn btn-secondary" id="date-filter-btn" onclick="toggleDatePanel(event)" title="按日期筛选">📅 <span id="date-filter-label">今天</span></button>
+          <div id="date-panel" style="display:none;position:absolute;top:calc(100% + 6px);left:0;z-index:50;background:var(--bg-card);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-md);padding:0.9rem;min-width:280px">
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:0.7rem">
+              <button type="button" class="date-preset" data-preset="today" onclick="setDatePreset('today')">今天</button>
+              <button type="button" class="date-preset" data-preset="yesterday" onclick="setDatePreset('yesterday')">昨天</button>
+              <button type="button" class="date-preset" data-preset="past3" onclick="setDatePreset('past3')">过去三天</button>
+              <button type="button" class="date-preset" data-preset="past7" onclick="setDatePreset('past7')">过去一周</button>
+              <button type="button" class="date-preset" data-preset="past30" onclick="setDatePreset('past30')">过去一个月</button>
+            </div>
+            <div style="margin-bottom:0.6rem">
+              <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:4px">指定某一天</div>
+              <input type="date" id="date-single" onchange="onDateSingle()" style="width:100%">
+            </div>
+            <div style="margin-bottom:0.7rem">
+              <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:4px">指定时间区间</div>
+              <div style="display:flex;gap:6px;align-items:center">
+                <input type="date" id="date-from" onchange="onDateRange()" style="flex:1">
+                <span style="color:var(--text-muted)">~</span>
+                <input type="date" id="date-to" onchange="onDateRange()" style="flex:1">
+              </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;gap:6px">
+              <button type="button" class="btn btn-secondary" style="padding:0.4rem 0.8rem;font-size:0.85rem" onclick="clearDateFilter()">清除（全部）</button>
+              <button type="button" class="btn btn-secondary" style="padding:0.4rem 0.8rem;font-size:0.85rem" onclick="closeDatePanel()">关闭</button>
+            </div>
+          </div>
+        </div>
         <input type="text" id="tweet-search" placeholder="搜索推文..." oninput="filterTweets()">
       </div>
       <div class="gen-progress" id="video-progress">
@@ -194,6 +226,7 @@
     window.__INITIAL_SOURCES__ = {{ available_sources | tojson }};
     let _tweets=[], _articles=[], _players=[], _selPlayer='', _page=1, _perPage=10, _videoGenCount=0, _videoGenBefore=0;
     let _tPoll=null, _vPoll=null;
+    let _dateFilter={mode:'preset',value:'today'};
 
     function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
     function ago(iso){if(!iso)return'';try{const d=new Date(iso),s=(Date.now()-d)/1000;if(s<60)return'刚刚';if(s<3600)return Math.floor(s/60)+' 分钟前';if(s<86400)return Math.floor(s/3600)+' 小时前';if(s<604800)return Math.floor(s/86400)+' 天前';return d.toLocaleDateString('zh-CN',{month:'short',day:'numeric'});}catch{return iso;}}
@@ -215,10 +248,51 @@
       const q=(document.getElementById('tweet-search').value||'').toLowerCase().trim();
       let f=_tweets;
       if(_selPlayer)f=f.filter(t=>(t.player_handle||'').toLowerCase()===_selPlayer.toLowerCase());
+      const dr=getDateRange();
+      if(dr)f=f.filter(t=>{const ts=Date.parse(t.tweet_date);return !isNaN(ts)&&ts>=dr.from&&ts<=dr.to;});
       if(q)f=f.filter(t=>(t.content_cn||'').toLowerCase().includes(q)||(t.content||'').toLowerCase().includes(q)||(t.player_name||'').toLowerCase().includes(q));
       render(f);stats(_tweets);
     }
     function onPlayerFilter(){_selPlayer=document.getElementById('player-filter').value;_page=1;filterTweets();}
+
+    function startOfDay(d){const x=new Date(d);x.setHours(0,0,0,0);return x.getTime();}
+    function endOfDay(d){const x=new Date(d);x.setHours(23,59,59,999);return x.getTime();}
+    function fmt(d){const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),da=String(d.getDate()).padStart(2,'0');return `${y}-${m}-${da}`;}
+    function todayStr(){return fmt(new Date());}
+    function applyDateMax(){const t=todayStr();['date-single','date-from','date-to'].forEach(id=>{const el=document.getElementById(id);if(el)el.max=t;});}
+    function getDateRange(){
+      const f=_dateFilter;if(!f||f.mode==='all')return null;
+      const now=new Date();const todayStart=startOfDay(now);
+      if(f.mode==='preset'){
+        if(f.value==='today')return {from:todayStart,to:Date.now()};
+        if(f.value==='yesterday'){const y=new Date(now);y.setDate(y.getDate()-1);return {from:startOfDay(y),to:endOfDay(y)};}
+        if(f.value==='past3'){const s=new Date(now);s.setDate(s.getDate()-2);return {from:startOfDay(s),to:Date.now()};}
+        if(f.value==='past7'){const s=new Date(now);s.setDate(s.getDate()-6);return {from:startOfDay(s),to:Date.now()};}
+        if(f.value==='past30'){const s=new Date(now);s.setDate(s.getDate()-29);return {from:startOfDay(s),to:Date.now()};}
+      }
+      if(f.mode==='single'&&f.value){const d=new Date(f.value+'T00:00:00');return {from:startOfDay(d),to:endOfDay(d)};}
+      if(f.mode==='range'&&f.value){const a=new Date(f.value.from+'T00:00:00'),b=new Date(f.value.to+'T00:00:00');return {from:startOfDay(a),to:endOfDay(b)};}
+      return null;
+    }
+    function updateDateLabel(){
+      const presetNames={today:'今天',yesterday:'昨天',past3:'过去三天',past7:'过去一周',past30:'过去一个月'};
+      const el=document.getElementById('date-filter-label');if(!el)return;
+      const f=_dateFilter;
+      if(f.mode==='all')el.textContent='全部时间';
+      else if(f.mode==='preset')el.textContent=presetNames[f.value]||'今天';
+      else if(f.mode==='single')el.textContent=f.value||'选择日期';
+      else if(f.mode==='range'&&f.value)el.textContent=`${f.value.from} ~ ${f.value.to}`;
+      document.querySelectorAll('.date-preset').forEach(b=>{
+        b.classList.toggle('active',f.mode==='preset'&&b.dataset.preset===f.value);
+      });
+    }
+    function toggleDatePanel(e){if(e)e.stopPropagation();const p=document.getElementById('date-panel');p.style.display=p.style.display==='none'?'block':'none';}
+    function closeDatePanel(){document.getElementById('date-panel').style.display='none';}
+    function setDatePreset(v){_dateFilter={mode:'preset',value:v};document.getElementById('date-single').value='';document.getElementById('date-from').value='';document.getElementById('date-to').value='';_page=1;updateDateLabel();filterTweets();}
+    function onDateSingle(){const v=document.getElementById('date-single').value;if(!v)return;if(v>todayStr()){toast('不能选择未来日期','warning');document.getElementById('date-single').value='';return;}_dateFilter={mode:'single',value:v};document.getElementById('date-from').value='';document.getElementById('date-to').value='';_page=1;updateDateLabel();filterTweets();}
+    function onDateRange(){const a=document.getElementById('date-from').value,b=document.getElementById('date-to').value;if(!a||!b)return;const t=todayStr();if(a>t||b>t){toast('不能选择未来日期','warning');if(a>t)document.getElementById('date-from').value='';if(b>t)document.getElementById('date-to').value='';return;}if(a>b){toast('开始日期必须早于或等于结束日期','warning');return;}_dateFilter={mode:'range',value:{from:a,to:b}};document.getElementById('date-single').value='';_page=1;updateDateLabel();filterTweets();}
+    function clearDateFilter(){_dateFilter={mode:'all',value:null};document.getElementById('date-single').value='';document.getElementById('date-from').value='';document.getElementById('date-to').value='';_page=1;updateDateLabel();filterTweets();}
+    document.addEventListener('click',e=>{const w=document.querySelector('.date-filter-wrap');if(w&&!w.contains(e.target))closeDatePanel();});
 
     function render(tweets){
       const c=document.getElementById('tweet-feed');
@@ -229,12 +303,13 @@
       c.innerHTML=vis.map((t,i)=>{
         const init=(t.player_name||'?')[0], hasV=!!t.video_url;
         let media='';
+        if(t.cover_image_path){
+          const u='/covers/'+esc(t.cover_image_path.replace('covers/',''));
+          media+=`<div class="tweet-screenshot" onclick="openLightbox('${u}')"><img src="${u}" alt="Tweet" loading="lazy"></div>`;
+        }
         if(hasV){
           const poster=t.cover_image_path?'/covers/'+esc(t.cover_image_path.replace('covers/','')):'';
-          media=`<div class="tweet-video"><video controls preload="auto" poster="${poster}" style="max-width:100%;border-radius:8px"><source src="${esc(t.video_url)}" type="video/mp4"></video></div>`;
-        }else if(t.cover_image_path){
-          const u='/covers/'+esc(t.cover_image_path.replace('covers/',''));
-          media=`<div class="tweet-screenshot" onclick="openLightbox('${u}')"><img src="${u}" alt="Tweet" loading="lazy"></div>`;
+          media+=`<div class="tweet-video"><video controls preload="auto" poster="${poster}" style="max-width:100%;border-radius:8px"><source src="${esc(t.video_url)}" type="video/mp4"></video></div>`;
         }
         const tr=t.translation_status==='completed';
         return `<div class="tweet-item" style="animation-delay:${i*0.04}s">
@@ -246,7 +321,7 @@
           </div>
           <div class="tweet-body"><div class="tweet-text-cn">${esc(t.content_cn||t.content)}</div>${t.content_cn?`<div class="tweet-text-en">${esc(t.content)}</div>`:''}</div>
           ${media}
-          <div class="tweet-footer"><span style="color:var(--text-muted);font-size:0.8rem">${hasV?'🎬 视频':'📸 截图'}</span><a href="${esc(t.url)}" target="_blank" rel="noopener noreferrer">查看原文 →</a></div>
+          <div class="tweet-footer"><span style="color:var(--text-muted);font-size:0.8rem">${hasV&&t.cover_image_path?'📸 截图 + 🎬 视频':hasV?'🎬 视频':'📸 截图'}</span><a href="${esc(t.url)}" target="_blank" rel="noopener noreferrer">查看原文 →</a></div>
         </div>`;
       }).join('');
       // 分页
@@ -262,7 +337,7 @@
       updateVideoSelection();
     }
     function goPage(p){_page=p;filterTweets();window.scrollTo({top:document.getElementById('tweet-feed').offsetTop-80,behavior:'smooth'});}
-    function stats(t){/* 本地统计仅作为后备 */document.getElementById('ts-total').textContent=t.length;document.getElementById('ts-players').textContent=new Set(t.map(x=>x.player_handle)).size;document.getElementById('ts-videos').textContent=t.filter(x=>x.video_url).length;document.getElementById('ts-translated').textContent=t.filter(x=>x.translation_status==='completed').length;}
+    function stats(t){/* 本地统计仅作为后备 */document.getElementById('ts-total').textContent=t.length;document.getElementById('ts-players').textContent=new Set(t.map(x=>x.player_handle)).size;document.getElementById('ts-videos').textContent=t.filter(x=>x.generated_video_url).length;document.getElementById('ts-translated').textContent=t.filter(x=>x.translation_status==='completed').length;}
     function applyServerStats(s){if(!s)return;document.getElementById('ts-total').textContent=s.total;document.getElementById('ts-players').textContent=s.players;document.getElementById('ts-videos').textContent=s.videos;document.getElementById('ts-translated').textContent=s.translated;}
 
     /* 推文爬虫 */
@@ -368,7 +443,7 @@
         document.getElementById('video-progress').classList.add('active');
         toast(`视频生成已启动 (${d.count} 条)`,'success');
         _videoGenCount=d.count;
-        _videoGenBefore=_tweets.filter(t=>t.video_url).length;
+        _videoGenBefore=_tweets.filter(t=>t.generated_video_url).length;
         if(!_vPoll)_vPoll=setInterval(pollVideo,3000);
         document.getElementById('vlog-panel').style.display='block';
         document.getElementById('vlog-content').innerHTML='<div style="color:#9ca3af">正在连接 Video 服务器...</div>';
@@ -415,7 +490,7 @@
     /* 资讯 */
     async function loadArticles(){try{const r=await fetch('/api/articles');if(!r.ok)return;_articles=await r.json();const c=document.getElementById('article-list');c.className='article-grid';if(!_articles.length){c.innerHTML='<div class="empty-state"><div class="empty-icon">📭</div><p>暂无资讯</p></div>';return;}c.innerHTML=_articles.slice(0,20).map((a,i)=>`<article class="article-card" style="--i:${i}"><div class="card-top"><span class="source-badge">${esc(a.source)}</span></div><h2 class="title-cn">${esc(a.title_cn||a.title)}</h2><p class="title-en">${esc(a.title)}</p><p class="summary">${esc(a.summary_cn||a.summary||'')}</p><div class="card-footer"><span class="date">🕐 ${ago(a.publish_date)}</span><a href="${esc(a.url)}" target="_blank" rel="noopener noreferrer" class="read-link">阅读原文 →</a></div></article>`).join('');document.getElementById('stat-total').textContent=_articles.length;document.getElementById('stat-translated').textContent=_articles.filter(a=>a.translation_status==='completed').length;document.getElementById('stat-sources').textContent=new Set(_articles.map(a=>a.source)).size;}catch{}}
 
-    document.addEventListener('DOMContentLoaded',()=>{loadTweets();loadPlayers();checkTweetStatus();});
+    document.addEventListener('DOMContentLoaded',()=>{applyDateMax();updateDateLabel();loadTweets();loadPlayers();checkTweetStatus();});
 
     async function shutdownServer(){
       if(!confirm('确定要关闭服务器吗？')) return;
