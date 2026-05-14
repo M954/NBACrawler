@@ -930,7 +930,12 @@ def _read_video_log_tail(max_lines: int = 120) -> str:
     if not log_file.exists():
         return ""
     try:
-        lines = log_file.read_text(encoding="utf-8").splitlines()
+        raw = log_file.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("utf-8", errors="replace")
+        lines = text.splitlines()
         return "\n".join(lines[-max_lines:]).strip()
     except Exception:
         return ""

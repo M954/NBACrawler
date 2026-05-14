@@ -552,14 +552,27 @@
     async function pollVideoLogs(){
       try{
         const r=await fetch(`/api/video-server/logs?ts=${Date.now()}`,{cache:'no-store'});
-        const text=await r.json();
+        const data=await r.json();
         const el=document.getElementById('vlog-content');
-        if(!text){
+        let lines=[];
+        if(Array.isArray(data)){
+          lines=data.map(e=>{
+            if(e&&typeof e==='object'){
+              const t=e.time||'';const lv=e.level||'info';const m=e.message||'';
+              return `[${t}] [${lv}] ${m}`;
+            }
+            return String(e);
+          });
+        }else if(typeof data==='string'){
+          lines=data.split('\n');
+        }else if(data){
+          lines=[JSON.stringify(data)];
+        }
+        lines=lines.filter(l=>l&&l.trim());
+        if(!lines.length){
           el.innerHTML='<div style="color:#6b7280">暂无日志</div>';
           return;
         }
-        // 纯文本日志，按行渲染并染色
-        const lines=(typeof text==='string'?text:JSON.stringify(text,null,2)).split('\n').filter(l=>l.trim());
         el.innerHTML=lines.map(l=>{
           let color='#9ca3af';
           if(l.includes('[error]'))color='#ef4444';
