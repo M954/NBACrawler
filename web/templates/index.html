@@ -409,12 +409,25 @@
       panel.style.display='block';
       if(errorCount>0){badge.style.display='';badge.textContent=errorCount+' 错误';}
       else{badge.style.display='none';}
+      // 若用户正在选中本面板内的文字，跳过这次刷新（否则 innerHTML 重写会清空选区）
+      if(_isUserSelectingIn(content)) return;
       const colors={info:'var(--text-muted)',success:'#10b981',warn:'#f59e0b',error:'#ef4444'};
       content.innerHTML=logs.map(l=>{
         const c=colors[l.level]||colors.info;
         return '<div style="color:'+c+'"><span style="opacity:0.6">'+esc(l.time)+'</span> '+esc(l.msg)+'</div>';
       }).join('');
-      content.scrollTop=content.scrollHeight;
+    }
+
+    // 共用：判断用户是否正在 el 内部选中文本
+    function _isUserSelectingIn(el){
+      const sel=window.getSelection&&window.getSelection();
+      if(!sel||sel.isCollapsed||sel.rangeCount===0) return false;
+      const node=sel.anchorNode;
+      return !!(node&&el&&el.contains(node));
+    }
+    // 共用：判断滚动条是否贴在底部（容差 8px）
+    function _isStuckToBottom(el){
+      return el.scrollHeight - el.scrollTop - el.clientHeight < 8;
     }
 
     /* 视频生成 - 选择模式 */
@@ -573,6 +586,8 @@
           el.innerHTML='<div style="color:#6b7280">暂无日志</div>';
           return;
         }
+        // 若用户正在选中本面板内的文字，跳过这次刷新
+        if(_isUserSelectingIn(el)) return;
         el.innerHTML=lines.map(l=>{
           let color='#9ca3af';
           if(l.includes('[error]'))color='#ef4444';
@@ -580,7 +595,6 @@
           else if(l.includes('[success]'))color='#10b981';
           return `<div style="color:${color}">${l.replace(/</g,'&lt;')}</div>`;
         }).join('');
-        el.scrollTop=el.scrollHeight;
       }catch{
         document.getElementById('vlog-content').innerHTML='<div style="color:#6b7280">无法读取日志</div>';
       }
